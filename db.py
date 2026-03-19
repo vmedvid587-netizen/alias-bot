@@ -1,12 +1,13 @@
 """
-Постійне сховище рейтингів у PostgreSQL (Supabase).
-Використовує pg8000 через Supabase connection pooler (порт 6543).
+Постійне сховище рейтингів у PostgreSQL.
+Працює з Railway PostgreSQL (postgres.railway.internal:5432)
+та будь-якою іншою PostgreSQL базою.
 """
 
 import os
 import ssl
 import logging
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 from contextlib import contextmanager
 
 import pg8000.native
@@ -21,25 +22,28 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 def _parse_url(url: str) -> dict:
     """Розбирає DATABASE_URL на параметри для pg8000."""
     r = urlparse(url)
-    # Supabase connection pooler працює на порту 6543
-    # Прямий порт 5432 часто блокується файрволами
-    port = r.port or 5432
-    if port == 5432:
-        port = 6543
 
-    # SSL контекст для Supabase
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    # SSL: вмикаємо для зовнішніх хостів, вимикаємо для внутрішніх Railway
+    host = r.hostname or ""
+    if "railway.internal" in host or host in ("localhost", "127.0.0.1"):
+        ssl_context = None   # внутрішня мережа — без SSL
+    else:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ssl_context = ctx
 
-    return {
-        "host":        r.hostname,
-        "port":        port,
-        "database":    r.path.lstrip("/"),
-        "user":        r.username,
-        "password":    r.password,
-        "ssl_context": ctx,
+    params = {
+        "host":     host,
+        "port":     r.port or 5432,
+        "database": r.path.lstrip("/"),
+        "user":     r.username,
+        "password": r.password,
     }
+    if ssl_context is not None:
+        params["ssl_context"] = ssl_context
+
+    return params
 
 
 @contextmanager
@@ -47,8 +51,7 @@ def _conn():
     if not DATABASE_URL:
         raise ValueError(
             "Змінна середовища DATABASE_URL не задана!\n"
-            "Додай її у Railway -> Variables:\n"
-            "  DATABASE_URL=postgresql://postgres:пароль@db.xxxx.supabase.co:5432/postgres"
+            "Додай її у Railway -> Variables."
         )
     params = _parse_url(DATABASE_URL)
     con = pg8000.native.Connection(**params)
