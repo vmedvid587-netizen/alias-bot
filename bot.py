@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-🗣 Еліас-бот — авто-детекція відповіді по повідомленнях у чаті
+🗣 Еліас-бот — без черги, без таймера ходу
+Слово активне 10 хвилин, потім скипується автоматично.
 """
 
 import asyncio
 import logging
 import os
+import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -16,19 +18,26 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 from game import (
-    Game, GameState, Turn, Player,
+    Game, GameState, ActiveWord,
     get_game, create_game, delete_game,
     is_correct_guess,
-    record_game_results, get_rating_text,
 )
-from words import get_random_word, WORDS
-from db import init_db
+from db import (
+    init_db, record_game_results,
+    get_rating_text, get_user_stats, get_user_stats_all_chats,
+)
+from words import WORDS
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+WORD_TIMEOUT      = 10 * 60   # 10 хвилин — слово скипується якщо ніхто не вгадав
+INACTIVITY_TIMEOUT = 20 * 60  # 20 хвилин без вгаданих слів — сесія завершується
+NO_EXPLAINER_TIMEOUT = 5 * 60 # 5 хвилин без ведучого — сесія завершується
+VOLUNTEER_EXCL_SEC = 30        # секунд ексклюзивного вікна для відгадувача
 
 
 # ═══════════════════════════════ helpers ════════════════════════════
@@ -45,76 +54,185 @@ def _cancel_jobs(context: ContextTypes.DEFAULT_TYPE, name: str):
         job.schedule_removal()
 
 
-async def _safe_edit(context: ContextTypes.DEFAULT_TYPE,
-                     chat_id: int, msg_id: int,
-                     text: str, kb=None):
+def _reset_inactivity(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Скидає таймер бездіяльності після кожного вгаданого слова."""
+    _cancel_jobs(context, f"inactive_{chat_id}")
+    context.application.job_queue.run_once(
+        _inactivity_cb,
+        INACTIVITY_TIMEOUT,
+        data={"chat_id": chat_id},
+        name=f"inactive_{chat_id}",
+    )
+
+
+def _start_word_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, word: str):
+    """Запускає таймер на 10 хвилин для поточного слова."""
+    _cancel_jobs(context, f"word_{chat_id}")
+    context.application.job_queue.run_once(
+        _word_timeout_cb,
+        WORD_TIMEOUT,
+        data={"chat_id": chat_id, "word": word},
+        name=f"word_{chat_id}",
+    )
+
+
+async def _safe_edit(context, chat_id, msg_id, text, kb=None):
     try:
         await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
-            text=text,
-            reply_markup=kb,
+            chat_id=chat_id, message_id=msg_id,
+            text=text, reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN,
         )
     except BadRequest:
         pass
 
 
-# ═══════════════════════════ клавіатури ═════════════════════════════
+async def _remove_kb(context, chat_id, msg_id):
+    try:
+        await context.bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+    except BadRequest:
+        pass
 
-def _turn_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    """Кнопки пояснювача під час ходу — ✅ немає, бот сам детектує відповідь."""
+
+# ═══════════════════════════ таймер-колбеки ═════════════════════════
+
+async def _word_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
+    """10 хвилин минуло — слово скипується, чекаємо нового ведучого."""
+    d = context.job.data
+    chat_id, expired_word = d["chat_id"], d["word"]
+    game = get_game(chat_id)
+    if not game or game.state != GameState.EXPLAINING:
+        return
+    aw = game.active_word
+    if not aw or aw.word != expired_word:
+        return
+
+    explainer = game.players.get(aw.explainer_id)
+    exp_name = explainer.name if explainer else "?"
+
+    if aw.card_msg_id:
+        await _remove_kb(context, chat_id, aw.card_msg_id)
+    if aw.reaction_msg_id:
+        await _remove_kb(context, chat_id, aw.reaction_msg_id)
+
+    _cancel_jobs(context, f"inactive_{chat_id}")
+    record_game_results(chat_id, game)
+    await context.bot.send_message(
+        chat_id,
+        f"⏰ *10 хвилин без вгаданих слів — сесію завершено!*\n\n"
+        f"Останнє слово *{aw.word.upper()}* так і не вгадали 🤷\n"
+        f"Пояснював: *{exp_name}*\n\n"
+        + game.get_scoreboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    game.state = GameState.FINISHED
+    delete_game(chat_id)
+
+
+async def _inactivity_cb(context: ContextTypes.DEFAULT_TYPE):
+    """20 хвилин без вгаданих слів — завершуємо сесію."""
+    chat_id = context.job.data["chat_id"]
+    game = get_game(chat_id)
+    if not game or game.state == GameState.FINISHED:
+        return
+
+    _cancel_jobs(context, f"word_{chat_id}")
+    _cancel_jobs(context, f"noexplainer_{chat_id}")
+
+    aw = game.active_word
+    if aw and aw.card_msg_id:
+        await _remove_kb(context, chat_id, aw.card_msg_id)
+
+    record_game_results(chat_id, game)
+    await context.bot.send_message(
+        chat_id,
+        "😴 *20 хвилин без вгаданих слів — сесію завершено!*\n\n"
+        + game.get_scoreboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    game.state = GameState.FINISHED
+    delete_game(chat_id)
+
+
+async def _no_explainer_cb(context: ContextTypes.DEFAULT_TYPE):
+    """5 хвилин ніхто не взяв слово — завершуємо сесію."""
+    chat_id = context.job.data["chat_id"]
+    game = get_game(chat_id)
+    if not game or game.state != GameState.IDLE:
+        return
+
+    _cancel_jobs(context, f"inactive_{chat_id}")
+    record_game_results(chat_id, game)
+    await context.bot.send_message(
+        chat_id,
+        "😴 *Ніхто не взяв слово протягом 5 хвилин — сесію завершено!*\n\n"
+        + game.get_scoreboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    game.state = GameState.FINISHED
+    delete_game(chat_id)
+
+
+# ══════════════════════════ клавіатури ══════════════════════════════
+
+def _explainer_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Кнопки ведучого: переглянути слово, нове слово."""
     c = chat_id
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👁 Моє слово",     callback_data=f"T_view_{c}"),
-            InlineKeyboardButton("◀️ Попереднє",     callback_data=f"T_prev_{c}"),
-        ],
-        [
-            InlineKeyboardButton("⏭ Нове слово",     callback_data=f"T_skip_{c}"),
-            InlineKeyboardButton("⏹ Завершити хід",  callback_data=f"T_end_{c}"),
-        ],
+        [InlineKeyboardButton("👁 Моє слово",     callback_data=f"E_view_{c}")],
+        [InlineKeyboardButton("⏭ Нове слово",     callback_data=f"E_skip_{c}")],
     ])
 
 
-def _next_turn_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+def _reaction_keyboard(chat_id: int, hearts: int, exp_name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💚 {hearts}  — дякую {exp_name}!",
+            callback_data=f"R_heart_{chat_id}",
+        )],
+        [InlineKeyboardButton(
+            "🖐 Хочу пояснювати!",
+            callback_data=f"R_volunteer_{chat_id}",
+        )],
+    ])
+
+
+def _volunteer_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶️ Почати хід!", callback_data=f"NEXT_{chat_id}")
+        InlineKeyboardButton("🖐 Хочу пояснювати!", callback_data=f"V_take_{chat_id}")
     ]])
 
 
-# ═══════════════════════════ тексти ═════════════════════════════════
+# ══════════════════════════ тексти ══════════════════════════════════
 
-def _card_text(game: Game, turn: Turn, note: str = "") -> str:
-    """Публічна картка ходу в груповому чаті."""
-    explainer = game.players.get(turn.explainer_id)
+def _card_text(game: Game, aw: ActiveWord, note: str = "") -> str:
+    explainer = game.players.get(aw.explainer_id)
     lines = []
     if note:
         lines.append(note + "\n")
     lines += [
         f"🎙 Пояснює: *{explainer.name if explainer else '?'}*",
-        f"⏱ Залишилось: *{turn.time_left} сек*",
-        f"✅ Вгадано: *{turn.guessed_count}*  |  ⏭ Пропущено: *{turn.skipped_count}*",
         "",
         "💬 _Пишіть варіанти в чат — бот зарахує автоматично!_",
-        "🔘 _Пояснювач: 👁 щоб побачити слово_",
+        "_Ведучий: натисни 👁 щоб переглянути слово_",
     ]
     return "\n".join(lines)
 
 
-# ═════════════════════════ /start  /help ════════════════════════════
+# ═════════════════════════ /start /help ═════════════════════════════
 
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     await update.message.reply_text(
         "👋 Привіт! Я бот для гри *Еліас* 🗣\n\n"
-        "Додай мене до групового чату і там пиши /newgame!\n\n"
+        "Додай мене до групового чату і пиши /newgame!\n\n"
         "📋 *Команди:*\n"
         "/newgame — нова гра\n"
-        "/startgame — почати (засновник)\n"
+        "/startgame — почати гру\n"
         "/score — рахунок\n"
-        "/rating — рейтинг чату\n"
+        "/rating — топ-25 гравців\n"
+        "/mystats — моя статистика\n"
         "/endgame — завершити гру",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -123,32 +241,26 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Правила Еліас*\n\n"
-        "Один гравець *пояснює* слово своїми словами — не можна називати "
-        "однокореневих. Всі інші пишуть варіанти прямо в чат.\n\n"
-        "Бот *автоматично* розпізнає правильну відповідь і зараховує "
-        "+1 очко тому хто вгадав.\n\n"
-        "🏆 Перемагає перший хто набере ціль очок.\n\n"
-        "🎮 *Кнопки пояснювача:*\n"
-        "• *👁 Моє слово* — показує слово тільки тобі\n"
-        "• *◀️ Попереднє* — повернутись до попереднього слова\n"
-        "• *⏭ Нове слово* — пропустити поточне\n"
-        "• *⏹ Завершити хід* — дострокове завершення\n\n"
-        "💡 Щоб грати — просто пишіть варіанти в чат під час ходу. "
-        "Бот автоматично додасть вас до гри як тільки ви щось вгадаєте!",
+        "Хтось бере слово → пояснює своїми словами → "
+        "інші пишуть варіанти прямо в чат.\n\n"
+        "Бот *автоматично* розпізнає правильну відповідь.\n\n"
+        "🖐 Після вгадування — натисни *«Хочу пояснювати!»* щоб взяти наступне слово.\n"
+        "💚 Постав серце ведучому якщо пояснення сподобалось.\n\n"
+        "⏰ Якщо слово не вгадали за *10 хвилин* — воно скипується.\n"
+        "😴 Сесія завершується після *20 хвилин* без вгаданих слів "
+        "або *5 хвилин* без ведучого.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# ═════════════════════════ /newgame ══════════════════════════════════
+# ═════════════════════════ /newgame ═════════════════════════════════
 
 async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
 
     if chat.type == "private":
-        await update.message.reply_text(
-            "⚠️ Додай мене до групового чату і запусти /newgame там!"
-        )
+        await update.message.reply_text("⚠️ Запусти /newgame у груповому чаті!")
         return
 
     existing = get_game(chat.id)
@@ -157,59 +269,11 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     game = create_game(chat.id, user.id)
-    game.add_player(user.id, uname(user))
+    game.ensure_player(user.id, uname(user))
 
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎯 15 очок", callback_data="S_15"),
-        InlineKeyboardButton("🎯 30 очок", callback_data="S_30"),
-        InlineKeyboardButton("🎯 50 очок", callback_data="S_50"),
-    ]])
-    await update.message.reply_text(
-        f"🎮 *{uname(user)} створює гру Еліас!*\n\n"
-        "Скільки очок для перемоги?",
-        reply_markup=kb,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cb_score_target(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    game = get_game(q.message.chat_id)
-    if not game:
-        return
-    if q.from_user.id != game.creator_id:
-        await q.answer("Тільки засновник обирає!", show_alert=True)
-        return
-
-    game.target_score = int(q.data.split("_")[1])
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("⏱ 30 сек", callback_data="D_30"),
-        InlineKeyboardButton("⏱ 60 сек", callback_data="D_60"),
-        InlineKeyboardButton("⏱ 90 сек", callback_data="D_90"),
-    ]])
-    await q.edit_message_text(
-        f"✅ Ціль: *{game.target_score} очок*\n\nСкільки секунд на хід?",
-        reply_markup=kb,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cb_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    chat_id = q.message.chat_id
-    game = get_game(chat_id)
-    if not game:
-        return
-    if q.from_user.id != game.creator_id:
-        await q.answer("Тільки засновник обирає!", show_alert=True)
-        return
-
-    game.turn_duration = int(q.data.split("_")[1])
-
+    # Вибір категорії
     cats = list(WORDS.keys())
-    context.bot_data[f"cats_{chat_id}"] = cats + [None]
+    context.bot_data[f"cats_{chat.id}"] = cats + [None]
     rows, row = [], []
     for i, c in enumerate(cats):
         row.append(InlineKeyboardButton(c, callback_data=f"C_{i}"))
@@ -220,10 +284,8 @@ async def cb_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append(row)
     rows.append([InlineKeyboardButton("🔀 Всі категорії", callback_data=f"C_{len(cats)}")])
 
-    await q.edit_message_text(
-        f"✅ Ціль: *{game.target_score} очок*\n"
-        f"✅ Час: *{game.turn_duration} сек*\n\n"
-        "Обери категорію:",
+    await update.message.reply_text(
+        f"🎮 *{uname(user)} створює гру Еліас!*\n\nОбери категорію слів:",
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -247,11 +309,9 @@ async def cb_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.edit_message_text(
         f"🗣 *Гра Еліас готується!*\n\n"
-        f"🏆 Ціль: *{game.target_score} очок*\n"
-        f"⏱ Час ходу: *{game.turn_duration} сек*\n"
         f"📚 Категорія: *{cat_label}*\n\n"
         f"Засновник починає: /startgame\n"
-        "_Всі охочі зможуть приєднатись просто вгадуючи слова під час гри!_",
+        "_Просто пишіть варіанти в чат — приєднання автоматичне!_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -272,199 +332,108 @@ async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if game.state != GameState.WAITING:
         await update.message.reply_text("⚠️ Гра вже розпочата!")
         return
-    if len(game.players) < 1:
-        await update.message.reply_text("⚠️ Щось пішло не так — гравців немає.")
-        return
 
-    game.build_turn_order()
-    game.state = GameState.PLAYING
+    game.state = GameState.IDLE
 
     await update.message.reply_text(
         f"🚀 *Гра Еліас починається!*\n\n"
-        f"🏆 Ціль: *{game.target_score} очок*  |  ⏱ *{game.turn_duration} сек/хід*\n"
-        f"📚 Категорія: *{game.category or 'Всі'}*\n\n"
-        "Пишіть варіанти в чат — бот зарахує сам!\n"
-        "_Нові гравці приєднуються автоматично, як тільки вгадають перше слово_ 🎉",
+        f"📚 *{game.category or 'Всі категорії'}*\n\n"
+        f"Перше слово пояснює *{uname(user)}*!",
         parse_mode=ParseMode.MARKDOWN,
     )
-    await asyncio.sleep(1)
-    await _announce_next_turn(context, chat_id)
+    # Засновник автоматично отримує перше слово
+    await _give_word(context, chat_id, user.id)
 
 
-# ═══════════════════════ логіка ходів ═══════════════════════════════
+# ══════════════════════════ ведучий ═════════════════════════════════
 
-async def _announce_next_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Оголошує наступний хід — тільки пояснювач може натиснути ▶️."""
+async def _ask_for_volunteer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Публікує кнопку 'Хочу пояснювати' і запускає таймер очікування."""
     game = get_game(chat_id)
     if not game or game.state == GameState.FINISHED:
         return
 
-    explainer = game.get_current_explainer()
-    if not explainer:
-        return
-
     await context.bot.send_message(
         chat_id,
-        f"🎯 Наступний пояснює: *{explainer.name}*\n\n"
-        f"_{explainer.name}, натисни ▶️ коли будеш готовий!_",
-        reply_markup=_next_turn_keyboard(chat_id),
+        "🎯 *Хто буде пояснювати наступне слово?*\n"
+        "_Натисни кнопку нижче!_",
+        reply_markup=_volunteer_keyboard(chat_id),
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    # Таймер: якщо ніхто не взяв — завершити
+    _cancel_jobs(context, f"noexplainer_{chat_id}")
+    context.application.job_queue.run_once(
+        _no_explainer_cb,
+        NO_EXPLAINER_TIMEOUT,
+        data={"chat_id": chat_id},
+        name=f"noexplainer_{chat_id}",
+    )
 
-async def cb_next_turn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пояснювач натиснув ▶️ Почати хід!"""
+
+async def cb_volunteer_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Хтось натиснув 'Хочу пояснювати!'"""
     q = update.callback_query
-    chat_id = int(q.data.split("_")[1])
+    chat_id = int(q.data.split("_")[2])
     game = get_game(chat_id)
 
-    if not game or game.state != GameState.PLAYING:
-        await q.answer()
+    if not game or game.state != GameState.IDLE:
+        await q.answer("Зараз це недоступно!", show_alert=True)
         return
 
-    explainer = game.get_current_explainer()
-    if not explainer:
-        await q.answer()
-        return
+    user = q.from_user
+    player = game.ensure_player(user.id, uname(user))
 
-    if q.from_user.id != explainer.user_id:
-        await q.answer(
-            f"Це хід {explainer.name}! Зачекай свого 😊",
-            show_alert=True,
-        )
-        return
+    # Скасовуємо таймер очікування ведучого
+    _cancel_jobs(context, f"noexplainer_{chat_id}")
 
     await q.edit_message_reply_markup(None)
-    await _start_turn(context, chat_id)
+    await _give_word(context, chat_id, user.id)
 
 
-async def _start_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Починає активний хід: публікує картку в групу."""
+async def _give_word(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    explainer_id: int,
+):
+    """Видає нове слово ведучому і публікує картку в чат."""
     game = get_game(chat_id)
     if not game:
         return
 
-    explainer = game.get_current_explainer()
-    if not explainer:
-        return
-
-    word, category = get_random_word(game.used_words, game.category)
-    if not word:
+    aw = game.start_word(explainer_id)
+    if not aw:
+        record_game_results(chat_id, game)
         await context.bot.send_message(
             chat_id,
             "😱 Слова скінчились! Гра завершена!\n\n" + game.get_scoreboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
         game.state = GameState.FINISHED
+        delete_game(chat_id)
         return
 
-    game.used_words.add(word)
-    turn = Turn(
-        explainer_id=explainer.user_id,
-        word=word,
-        category=category,
-        duration=game.turn_duration,
-    )
-    game.current_turn = turn
-    game.state = GameState.TURN_ACTIVE
-    explainer.turns_played += 1
+    explainer = game.players.get(explainer_id)
 
-    msg = await context.bot.send_message(
+    # Картка в груповому чаті (слово НЕ показуємо)
+    card_msg = await context.bot.send_message(
         chat_id,
-        _card_text(game, turn),
-        reply_markup=_turn_keyboard(chat_id),
+        _card_text(game, aw),
+        reply_markup=_explainer_keyboard(chat_id),
         parse_mode=ParseMode.MARKDOWN,
     )
-    turn.group_msg_id = msg.message_id
+    aw.card_msg_id = card_msg.message_id
 
-    _cancel_jobs(context, f"turn_{chat_id}")
-    context.application.job_queue.run_once(
-        _timeout_cb,
-        game.turn_duration,
-        data={"chat_id": chat_id, "explainer_id": explainer.user_id},
-        name=f"turn_{chat_id}",
-    )
+    # Слово ведучий бачить через кнопку 👁 у груповому чаті
+
+    # Таймер 10 хвилин на слово
+    _start_word_timer(context, chat_id, aw.word)
+    _reset_inactivity(context, chat_id)
 
 
-async def _timeout_cb(context: ContextTypes.DEFAULT_TYPE):
-    d = context.job.data
-    game = get_game(d["chat_id"])
-    if not game or game.state != GameState.TURN_ACTIVE:
-        return
-    t = game.current_turn
-    if not t or t.explainer_id != d["explainer_id"]:
-        return
-    await _finish_turn(context, d["chat_id"], timed_out=True)
-
-
-async def _finish_turn(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    timed_out: bool = False,
-):
-    game = get_game(chat_id)
-    if not game:
-        return
-    turn = game.current_turn
-    if not turn:
-        return
-
-    _cancel_jobs(context, f"turn_{chat_id}")
-
-    explainer = game.players.get(turn.explainer_id)
-    if explainer:
-        explainer.explained += turn.guessed_count
-
-    # Прибираємо кнопки з картки
-    if turn.group_msg_id:
-        try:
-            await context.bot.edit_message_reply_markup(
-                chat_id, turn.group_msg_id, reply_markup=None
-            )
-        except BadRequest:
-            pass
-
-    summary = (
-        f"{'⏰ Час вийшов!' if timed_out else '⏹ Хід завершено!'}\n\n"
-        f"👤 Пояснював: *{explainer.name if explainer else '?'}*\n"
-        f"✅ Вгадано: *{turn.guessed_count}*"
-    )
-    if turn.words_guessed:
-        summary += "\n" + "\n".join(
-            f"  • {w}  ← {game.players[uid].name}"
-            for w, uid in turn.words_guessed
-            if uid in game.players
-        )
-    if turn.skipped_count:
-        summary += f"\n⏭ Пропущено: *{turn.skipped_count}*"
-
-    await context.bot.send_message(chat_id, summary, parse_mode=ParseMode.MARKDOWN)
-
-    game.advance_turn()
-    game.state = GameState.PLAYING
-
-    winner = game.get_winner()
-    if winner:
-        record_game_results(chat_id, game, winner)
-        await context.bot.send_message(
-            chat_id,
-            f"🏆 *{winner.name} переміг!* 🎉\n\n" + game.get_scoreboard(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        game.state = GameState.FINISHED
-        return
-
-    await asyncio.sleep(2)
-    await _announce_next_turn(context, chat_id)
-
-
-# ═══════════════════ Авто-детекція відповіді ════════════════════════
+# ═══════════════════════ Авто-детекція відповіді ════════════════════
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Слухаємо кожне текстове повідомлення у групі.
-    Якщо гра активна і текст збігається зі словом — зараховуємо очко.
-    """
     msg = update.message
     if not msg or not msg.text:
         return
@@ -473,207 +442,220 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = msg.from_user
     game = get_game(chat_id)
 
-    if not game or game.state != GameState.TURN_ACTIVE:
+    if not game or game.state != GameState.EXPLAINING:
         return
 
-    turn = game.current_turn
-    if not turn:
+    aw = game.active_word
+    if not aw:
         return
 
-    # Пояснювач не може вгадувати своє слово
-    if user.id == turn.explainer_id:
+    # Ведучий не вгадує своє слово
+    if user.id == aw.explainer_id:
         return
 
-    # Перевіряємо чи текст — правильна відповідь
-    if not is_correct_guess(msg.text, turn.word):
+    if not is_correct_guess(msg.text, aw.word):
         return
 
-    # ── Правильна відповідь! ─────────────────────────────────────
-
+    # ── Правильна відповідь! ─────────────────────────────────────────
     guesser_name = uname(user)
+    player = game.ensure_player(user.id, guesser_name)
+    player.guessed += 1
 
-    # Автоматично додаємо гравця якщо його ще немає в грі
-    if user.id not in game.players:
-        game.add_player(user.id, guesser_name)
+    guessed_word = aw.word
+    explainer = game.players.get(aw.explainer_id)
+    exp_name = explainer.name if explainer else "ведучий"
+    if explainer:
+        explainer.explained += 1
 
-    game.players[user.id].guessed += 1
+    # Скасовуємо таймер слова
+    _cancel_jobs(context, f"word_{chat_id}")
+    _reset_inactivity(context, chat_id)
 
-    guessed_word = turn.word
-    turn.words_guessed.append((guessed_word, user.id))
+    # Прибираємо кнопки з картки
+    if aw.card_msg_id:
+        await _remove_kb(context, chat_id, aw.card_msg_id)
 
-    # Зберігаємо для кнопки "◀️ Попереднє"
-    prev_w, prev_c = turn.word, turn.category
-    prev_guesser = user.id
+    # Ексклюзивне вікно 🖐 для відгадувача
+    aw.exclusive_uid = user.id
+    aw.exclusive_until = time.time() + VOLUNTEER_EXCL_SEC
 
-    # Беремо нове слово
-    word, category = get_random_word(game.used_words, game.category)
-
-    await context.bot.send_message(
+    # Реакція
+    reaction_msg = await context.bot.send_message(
         chat_id,
-        f"🎉 *{guesser_name}* вгадав — *{guessed_word.upper()}*! +1 очко",
+        f"🎉 *{guesser_name}* відгадав(-ла) слово *{guessed_word.upper()}*\n\n"
+        f"Постав 💚 ведучому *{exp_name}*, якщо пояснення сподобалось",
+        reply_markup=_reaction_keyboard(chat_id, aw.hearts_count, exp_name),
         parse_mode=ParseMode.MARKDOWN,
     )
+    aw.reaction_msg_id = reaction_msg.message_id
 
-    # Перевіряємо переможця
-    winner = game.get_winner()
-    if winner:
-        _cancel_jobs(context, f"turn_{chat_id}")
-        explainer = game.players.get(turn.explainer_id)
-        if explainer:
-            explainer.explained += turn.guessed_count
-        if turn.group_msg_id:
-            try:
-                await context.bot.edit_message_reply_markup(
-                    chat_id, turn.group_msg_id, reply_markup=None
-                )
-            except BadRequest:
-                pass
-        record_game_results(chat_id, game, winner)
-        await context.bot.send_message(
-            chat_id,
-            f"🏆 *{winner.name} переміг!* 🎉\n\n" + game.get_scoreboard(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        game.state = GameState.FINISHED
-        return
+    # Завершуємо активне слово
+    game.active_word = None
+    game.state = GameState.IDLE
 
-    if not word:
-        _cancel_jobs(context, f"turn_{chat_id}")
-        await _finish_turn(context, chat_id)
-        return
-
-    game.used_words.add(word)
-    turn.previous_word     = prev_w
-    turn.previous_category = prev_c
-    turn.previous_guesser_id = prev_guesser
-    turn.word     = word
-    turn.category = category
-
-    # Оновлюємо картку
-    if turn.group_msg_id:
-        await _safe_edit(
-            context, chat_id, turn.group_msg_id,
-            _card_text(game, turn, "✅ *Вгадали! Наступне слово:*"),
-            _turn_keyboard(chat_id),
-        )
+    # Питаємо хто пояснюватиме далі
+    await asyncio.sleep(1)
+    await _ask_for_volunteer(context, chat_id)
 
 
-# ════════════════════ Кнопки пояснювача (T_*) ═══════════════════════
+# ═══════════════════════ Кнопки ведучого (E_*) ══════════════════════
 
-async def cb_turn_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     _, action, cid_str = q.data.split("_", 2)
     chat_id = int(cid_str)
     game = get_game(chat_id)
 
-    if not game or game.state != GameState.TURN_ACTIVE:
-        await q.answer("Хід не активний!", show_alert=True)
+    if not game or game.state != GameState.EXPLAINING:
+        await q.answer("Слово вже неактивне!", show_alert=True)
         return
 
-    turn = game.current_turn
-    if not turn:
+    aw = game.active_word
+    if not aw:
         await q.answer()
         return
 
-    # Тільки пояснювач може натискати кнопки
-    if q.from_user.id != turn.explainer_id:
-        explainer = game.players.get(turn.explainer_id)
+    if q.from_user.id != aw.explainer_id:
+        explainer = game.players.get(aw.explainer_id)
         await q.answer(
-            f"Ці кнопки для {explainer.name if explainer else 'пояснювача'}. "
+            f"Ці кнопки для {explainer.name if explainer else 'ведучого'}. "
             "Ти вгадуй — просто пиши в чат 😊",
             show_alert=True,
         )
         return
 
-    # ── VIEW ──────────────────────────────────────────────────────
+    # VIEW
     if action == "view":
-        await q.answer(
-            f"🔤 {turn.word.upper()}\n📚 {turn.category}",
-            show_alert=True,
-        )
+        await q.answer(f"🔤 {aw.word.upper()}\n📚 {aw.category}", show_alert=True)
         return
 
-    # ── PREV ──────────────────────────────────────────────────────
-    if action == "prev":
-        if not turn.previous_word:
-            await q.answer("Попереднього слова немає!", show_alert=True)
-            return
-
-        # Знімаємо очко з того, хто вгадав попереднє слово
-        if turn.previous_guesser_id and turn.previous_guesser_id in game.players:
-            game.players[turn.previous_guesser_id].guessed = max(
-                0, game.players[turn.previous_guesser_id].guessed - 1
-            )
-            # Прибираємо запис з words_guessed
-            turn.words_guessed = [
-                (w, uid) for w, uid in turn.words_guessed
-                if w != turn.previous_word
-            ]
-            await context.bot.send_message(
-                chat_id,
-                f"◀️ Повернулись до *{turn.previous_word.upper()}* — "
-                f"очко у *{game.players[turn.previous_guesser_id].name}* знято",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
-        # Свопаємо
-        curr_w, curr_c, curr_g = turn.word, turn.category, None
-        turn.word     = turn.previous_word
-        turn.category = turn.previous_category
-        turn.previous_word     = curr_w
-        turn.previous_category = curr_c
-        turn.previous_guesser_id = None
-
-        await q.answer(f"◀️ Повернулись до: {turn.word.upper()}")
-        await _safe_edit(
-            context, chat_id, turn.group_msg_id,
-            _card_text(game, turn, "◀️ *Повернулись до попереднього слова*"),
-            _turn_keyboard(chat_id),
-        )
-        return
-
-    # ── SKIP ──────────────────────────────────────────────────────
+    # SKIP
     if action == "skip":
-        await q.answer("⏭ Пропущено")
-        turn.words_skipped.append(turn.word)
-        prev_w, prev_c = turn.word, turn.category
+        await q.answer("⏭ Беремо нове слово")
+        _cancel_jobs(context, f"word_{chat_id}")
 
-        word, cat = get_random_word(game.used_words, game.category)
-        if not word:
-            _cancel_jobs(context, f"turn_{chat_id}")
-            await _safe_edit(
-                context, chat_id, turn.group_msg_id,
-                "⏭ Слова скінчились, хід завершується...",
-            )
-            await _finish_turn(context, chat_id)
-            return
+        if aw.card_msg_id:
+            await _remove_kb(context, chat_id, aw.card_msg_id)
 
-        game.used_words.add(word)
-        turn.previous_word     = prev_w
-        turn.previous_category = prev_c
-        turn.previous_guesser_id = None
-        turn.word     = word
-        turn.category = cat
+        explainer = game.players.get(aw.explainer_id)
+        exp_id = aw.explainer_id
 
-        await _safe_edit(
-            context, chat_id, turn.group_msg_id,
-            _card_text(game, turn, "⏭ *Пропущено*"),
-            _turn_keyboard(chat_id),
+        await context.bot.send_message(
+            chat_id,
+            f"⏭ *{explainer.name if explainer else '?'}* пропустив слово *{aw.word.upper()}*",
+            parse_mode=ParseMode.MARKDOWN,
         )
+
+        game.active_word = None
+        game.state = GameState.IDLE
+
+        # Той самий ведучий бере наступне слово одразу
+        await _give_word(context, chat_id, exp_id)
+
+
+# ════════════════════════ Кнопки реакцій (R_*) ══════════════════════
+
+async def cb_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split("_")
+    action  = parts[1]
+    chat_id = int(parts[2])
+    game = get_game(chat_id)
+
+    if not game:
+        await q.answer()
         return
 
-    # ── END ───────────────────────────────────────────────────────
-    if action == "end":
-        await q.answer("⏹ Хід завершено!")
-        _cancel_jobs(context, f"turn_{chat_id}")
-        await _safe_edit(
-            context, chat_id, turn.group_msg_id,
-            _card_text(game, turn, "⏹ *Пояснювач завершив хід*"),
-        )
-        await _finish_turn(context, chat_id, timed_out=False)
+    # Реакційне повідомлення належить до попереднього слова —
+    # шукаємо його в active_word (може бути None якщо вже нове слово)
+    # Серця і volunteer можуть спрацювати навіть після зміни слова
+    # тому зберігаємо стан реакції в context.bot_data
+
+    key = f"last_reaction_{chat_id}"
+
+    if action == "heart":
+        rdata = context.bot_data.get(key, {})
+        explainer_id = rdata.get("explainer_id")
+        hearts_key   = rdata.get("hearts_key", f"hearts_{chat_id}_{q.message.message_id}")
+
+        if not explainer_id:
+            await q.answer("Хід вже завершено!", show_alert=True)
+            return
+
+        if q.from_user.id == explainer_id:
+            await q.answer("Собі серце не ставлять 😄", show_alert=True)
+            return
+
+        given_set_key = f"hearts_given_{chat_id}_{q.message.message_id}"
+        given_set = context.bot_data.setdefault(given_set_key, set())
+
+        if q.from_user.id in given_set:
+            await q.answer("Ти вже поставив серце! 💚", show_alert=True)
+            return
+
+        given_set.add(q.from_user.id)
+
+        # Нараховуємо серце ведучому
+        exp_player = game.players.get(explainer_id)
+        if not exp_player:
+            # Гравець міг не потрапити ще в players якщо гра оновилась
+            pass
+        else:
+            exp_player.hearts += 1
+
+        count = rdata.get("hearts_count", 0) + 1
+        rdata["hearts_count"] = count
+        context.bot_data[key] = rdata
+
+        await q.answer("💚 Дякуємо!")
+        exp_name = rdata.get("exp_name", "ведучий")
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=_reaction_keyboard(chat_id, count, exp_name)
+            )
+        except BadRequest:
+            pass
+        return
+
+    if action == "volunteer":
+        user = q.from_user
+        uid = user.id
+
+        game.ensure_player(uid, uname(user))
+
+        # Якщо зараз вже хтось пояснює
+        if game.state == GameState.EXPLAINING:
+            aw = game.active_word
+            if aw and uid == aw.explainer_id:
+                await q.answer("Ти зараз ведучий! 😄", show_alert=True)
+                return
+
+        # Перевірка ексклюзивного вікна
+        rdata = context.bot_data.get(key, {})
+        excl_uid   = rdata.get("exclusive_uid")
+        excl_until = rdata.get("exclusive_until", 0)
+
+        if excl_uid and time.time() < excl_until and uid != excl_uid:
+            secs = int(excl_until - time.time())
+            guesser = game.players.get(excl_uid)
+            gname = guesser.name if guesser else "відгадувач"
+            await q.answer(
+                f"Зачекай {secs} сек — зараз черга {gname}, який щойно вгадав!",
+                show_alert=True,
+            )
+            return
+
+        if game.state != GameState.IDLE:
+            await q.answer("Зараз хтось пояснює — зачекай!", show_alert=True)
+            return
+
+        # Скасовуємо таймер очікування ведучого
+        _cancel_jobs(context, f"noexplainer_{chat_id}")
+        await q.edit_message_reply_markup(None)
+        await _give_word(context, chat_id, uid)
 
 
-# ══════════════════ /score  /rating  /endgame ════════════════════════
+# ════════════════════════════ /score ════════════════════════════════
 
 async def cmd_score(update: Update, _: ContextTypes.DEFAULT_TYPE):
     game = get_game(update.effective_chat.id)
@@ -681,22 +663,64 @@ async def cmd_score(update: Update, _: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Немає активної гри.")
         return
     text = game.get_scoreboard()
-    if game.current_turn:
-        exp = game.players.get(game.current_turn.explainer_id)
+    if game.active_word:
+        exp = game.players.get(game.active_word.explainer_id)
         if exp:
-            text += f"\n\n⏱ Зараз пояснює: *{exp.name}*"
+            text += f"\n\n🎙 Зараз пояснює: *{exp.name}*"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+# ════════════════════════════ /rating ═══════════════════════════════
+
 async def cmd_rating(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
-        await update.message.reply_text("📊 Рейтинг є тільки в групових чатах!")
+        await update.message.reply_text("📊 Рейтинг доступний тільки в групових чатах!")
         return
     await update.message.reply_text(
         get_rating_text(update.effective_chat.id),
         parse_mode=ParseMode.MARKDOWN,
     )
 
+
+# ════════════════════════════ /mystats ══════════════════════════════
+
+async def cmd_mystats(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    chat_stats = (
+        get_user_stats(chat_id, user.id)
+        if update.effective_chat.type != "private"
+        else None
+    )
+    all_stats = get_user_stats_all_chats(user.id)
+
+    if not all_stats:
+        await update.message.reply_text(
+            f"📊 *Статистика {uname(user)}*\n\nЩе немає зіграних ігор!",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = [f"📊 *СТАТИСТИКА КОРИСТУВАЧА {uname(user)}*\n"]
+    lines.append(f"Рейтинг: {all_stats['hearts_received']} 💚\n")
+
+    if chat_stats and update.effective_chat.type != "private":
+        lines.append("*В цьому чаті*")
+        lines.append(f"Був ведучим: {chat_stats['turns_played']}")
+        lines.append(f"Успішно пояснив: {chat_stats['total_explained']}")
+        lines.append(f"Відгадав: {chat_stats['total_guessed']}")
+        lines.append("")
+
+    lines.append("*В усіх чатах*")
+    lines.append(f"Був ведучим: {all_stats['turns_played']}")
+    lines.append(f"Успішно пояснив: {all_stats['total_explained']}")
+    lines.append(f"Відгадав: {all_stats['total_guessed']}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+# ════════════════════════════ /endgame ══════════════════════════════
 
 async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -710,9 +734,14 @@ async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Тільки засновник може завершити гру!")
         return
 
-    _cancel_jobs(context, f"turn_{chat_id}")
-    winner = game.get_winner()
-    record_game_results(chat_id, game, winner)
+    for job_name in [f"word_{chat_id}", f"inactive_{chat_id}", f"noexplainer_{chat_id}"]:
+        _cancel_jobs(context, job_name)
+
+    aw = game.active_word
+    if aw and aw.card_msg_id:
+        await _remove_kb(context, chat_id, aw.card_msg_id)
+
+    record_game_results(chat_id, game)
     await update.message.reply_text(
         "🛑 *Гру завершено!*\n\n" + game.get_scoreboard(),
         parse_mode=ParseMode.MARKDOWN,
@@ -720,37 +749,32 @@ async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delete_game(chat_id)
 
 
-# ═══════════════════════════════ main ═══════════════════════════════
+# ════════════════════════════ main ══════════════════════════════════
 
 def main():
     token = os.environ.get("BOT_TOKEN", "")
     if not token:
         raise ValueError("Постав BOT_TOKEN у змінні середовища!")
 
-    init_db()   # створює ratings.db і таблицю якщо їх ще немає
-    logger.info("✅ База даних ініціалізована: ratings.db")
+    init_db()
+    logger.info("✅ База даних готова")
 
     app = Application.builder().token(token).build()
 
-    # Команди
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("newgame",   cmd_newgame))
     app.add_handler(CommandHandler("startgame", cmd_startgame))
     app.add_handler(CommandHandler("score",     cmd_score))
     app.add_handler(CommandHandler("rating",    cmd_rating))
+    app.add_handler(CommandHandler("mystats",   cmd_mystats))
     app.add_handler(CommandHandler("endgame",   cmd_endgame))
 
-    # Налаштування гри
-    app.add_handler(CallbackQueryHandler(cb_score_target, pattern=r"^S_"))
-    app.add_handler(CallbackQueryHandler(cb_duration,     pattern=r"^D_"))
-    app.add_handler(CallbackQueryHandler(cb_category,     pattern=r"^C_"))
+    app.add_handler(CallbackQueryHandler(cb_category,      pattern=r"^C_"))
+    app.add_handler(CallbackQueryHandler(cb_volunteer_take, pattern=r"^V_take_"))
+    app.add_handler(CallbackQueryHandler(cb_explainer,     pattern=r"^E_"))
+    app.add_handler(CallbackQueryHandler(cb_reaction,      pattern=r"^R_"))
 
-    # Ходи
-    app.add_handler(CallbackQueryHandler(cb_next_turn,   pattern=r"^NEXT_"))
-    app.add_handler(CallbackQueryHandler(cb_turn_action, pattern=r"^T_"))
-
-    # ⬇️ Авто-детекція відповіді — текстові повідомлення в групах
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
         on_message,
@@ -761,7 +785,8 @@ def main():
             BotCommand("newgame",   "Нова гра"),
             BotCommand("startgame", "Почати гру"),
             BotCommand("score",     "Рахунок"),
-            BotCommand("rating",    "Рейтинг гравців"),
+            BotCommand("rating",    "Топ-25 гравців"),
+            BotCommand("mystats",   "Моя статистика"),
             BotCommand("endgame",   "Завершити гру"),
             BotCommand("help",      "Правила"),
         ])
