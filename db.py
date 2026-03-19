@@ -1,14 +1,14 @@
 """
 Постійне сховище рейтингів у PostgreSQL (Supabase).
-Рядок підключення береться зі змінної середовища DATABASE_URL.
+Використовує pg8000 — чистий Python, без системних залежностей.
 """
 
 import os
 import logging
+from urllib.parse import urlparse
 from contextlib import contextmanager
 
-import psycopg2
-import psycopg2.extras
+import pg8000.native
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +17,34 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # ════════════════════════════ підключення ════════════════════════════
 
+def _parse_url(url: str) -> dict:
+    """Розбирає DATABASE_URL на параметри для pg8000."""
+    r = urlparse(url)
+    return {
+        "host":        r.hostname,
+        "port":        r.port or 5432,
+        "database":    r.path.lstrip("/"),
+        "user":        r.username,
+        "password":    r.password,
+        "ssl_context": True,   # Supabase вимагає SSL
+    }
+
+
 @contextmanager
 def _conn():
-    con = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    if not DATABASE_URL:
+        raise ValueError(
+            "Змінна середовища DATABASE_URL не задана!\n"
+            "Додай її у Railway -> Variables:\n"
+            "  DATABASE_URL=postgresql://postgres:пароль@db.xxxx.supabase.co:5432/postgres"
+        )
+    params = _parse_url(DATABASE_URL)
+    con = pg8000.native.Connection(**params)
     try:
         yield con
-        con.commit()
+        con.run("COMMIT")
     except Exception:
-        con.rollback()
+        con.run("ROLLBACK")
         raise
     finally:
         con.close()
@@ -33,80 +53,78 @@ def _conn():
 # ════════════════════════════ ініціалізація ═══════════════════════════
 
 def init_db():
-    """Створює таблицю якщо її ще немає. Викликати один раз при старті бота."""
-    if not DATABASE_URL:
-        raise ValueError(
-            "Змінна середовища DATABASE_URL не задана!\n"
-            "Додай її у налаштуваннях Railway/Render:\n"
-            "  DATABASE_URL=postgresql://postgres:пароль@db.xxxx.supabase.co:5432/postgres"
-        )
-
+    """Створює таблицю якщо її ще немає."""
     with _conn() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS ratings (
-                    chat_id         BIGINT  NOT NULL,
-                    user_id         BIGINT  NOT NULL,
-                    name            TEXT    NOT NULL,
-                    games_played    INTEGER NOT NULL DEFAULT 0,
-                    games_won       INTEGER NOT NULL DEFAULT 0,
-                    total_guessed   INTEGER NOT NULL DEFAULT 0,
-                    total_explained INTEGER NOT NULL DEFAULT 0,
-                    turns_played    INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (chat_id, user_id)
-                )
-            """)
+        con.run("""
+            CREATE TABLE IF NOT EXISTS ratings (
+                chat_id         BIGINT  NOT NULL,
+                user_id         BIGINT  NOT NULL,
+                name            TEXT    NOT NULL,
+                games_played    INTEGER NOT NULL DEFAULT 0,
+                games_won       INTEGER NOT NULL DEFAULT 0,
+                total_guessed   INTEGER NOT NULL DEFAULT 0,
+                total_explained INTEGER NOT NULL DEFAULT 0,
+                turns_played    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, user_id)
+            )
+        """)
     logger.info("✅ PostgreSQL: таблиця ratings готова")
 
 
 # ════════════════════════════ запис результатів ═══════════════════════
 
-def save_game_results(chat_id: int, players: list[dict]):
-    """
-    Зберігає підсумки гри для кожного гравця (UPSERT).
-    Якщо гравець вже є — додає до його поточної статистики.
-    """
+def save_game_results(chat_id: int, players: list):
+    """Зберігає підсумки гри (UPSERT)."""
     with _conn() as con:
-        with con.cursor() as cur:
-            for p in players:
-                cur.execute("""
-                    INSERT INTO ratings
-                        (chat_id, user_id, name,
-                         games_played, games_won,
-                         total_guessed, total_explained, turns_played)
-                    VALUES
-                        (%(chat_id)s, %(user_id)s, %(name)s,
-                         %(games_played)s, %(games_won)s,
-                         %(total_guessed)s, %(total_explained)s, %(turns_played)s)
-                    ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                        name            = EXCLUDED.name,
-                        games_played    = ratings.games_played    + EXCLUDED.games_played,
-                        games_won       = ratings.games_won       + EXCLUDED.games_won,
-                        total_guessed   = ratings.total_guessed   + EXCLUDED.total_guessed,
-                        total_explained = ratings.total_explained + EXCLUDED.total_explained,
-                        turns_played    = ratings.turns_played    + EXCLUDED.turns_played
-                """, {
-                    "chat_id":         chat_id,
-                    "user_id":         p["user_id"],
-                    "name":            p["name"],
-                    "games_played":    1,
-                    "games_won":       1 if p.get("won") else 0,
-                    "total_guessed":   p.get("guessed", 0),
-                    "total_explained": p.get("explained", 0),
-                    "turns_played":    p.get("turns", 0),
-                })
+        for p in players:
+            con.run(
+                """
+                INSERT INTO ratings
+                    (chat_id, user_id, name,
+                     games_played, games_won,
+                     total_guessed, total_explained, turns_played)
+                VALUES
+                    (:chat_id, :user_id, :name,
+                     :games_played, :games_won,
+                     :total_guessed, :total_explained, :turns_played)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    name            = EXCLUDED.name,
+                    games_played    = ratings.games_played    + EXCLUDED.games_played,
+                    games_won       = ratings.games_won       + EXCLUDED.games_won,
+                    total_guessed   = ratings.total_guessed   + EXCLUDED.total_guessed,
+                    total_explained = ratings.total_explained + EXCLUDED.total_explained,
+                    turns_played    = ratings.turns_played    + EXCLUDED.turns_played
+                """,
+                chat_id=chat_id,
+                user_id=p["user_id"],
+                name=p["name"],
+                games_played=1,
+                games_won=1 if p.get("won") else 0,
+                total_guessed=p.get("guessed", 0),
+                total_explained=p.get("explained", 0),
+                turns_played=p.get("turns", 0),
+            )
 
 
 # ════════════════════════════ читання рейтингу ════════════════════════
 
-def get_rating_rows(chat_id: int) -> list[dict]:
-    """Повертає рядки відсортовані за кількістю вгаданих слів."""
+def get_rating_rows(chat_id: int) -> list:
+    """Повертає список словників відсортований за кількістю вгаданих слів."""
     with _conn() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                SELECT *
-                FROM   ratings
-                WHERE  chat_id = %s
-                ORDER  BY total_guessed DESC, games_won DESC
-            """, (chat_id,))
-            return cur.fetchall()
+        rows = con.run(
+            """
+            SELECT chat_id, user_id, name,
+                   games_played, games_won,
+                   total_guessed, total_explained, turns_played
+            FROM   ratings
+            WHERE  chat_id = :chat_id
+            ORDER  BY total_guessed DESC, games_won DESC
+            """,
+            chat_id=chat_id,
+        )
+        cols = [
+            "chat_id", "user_id", "name",
+            "games_played", "games_won",
+            "total_guessed", "total_explained", "turns_played",
+        ]
+        return [dict(zip(cols, row)) for row in rows]
