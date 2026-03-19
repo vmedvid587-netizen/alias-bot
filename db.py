@@ -1,7 +1,5 @@
 """
 Постійне сховище рейтингів у PostgreSQL.
-Працює з Railway PostgreSQL (postgres.railway.internal:5432)
-та будь-якою іншою PostgreSQL базою.
 """
 
 import os
@@ -17,21 +15,19 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
-# ════════════════════════════ підключення ════════════════════════════
-
-def _parse_url(url: str) -> dict:
-    """Розбирає DATABASE_URL на параметри для pg8000."""
-    r = urlparse(url)
-
-    # SSL: вмикаємо для зовнішніх хостів, вимикаємо для внутрішніх Railway
+@contextmanager
+def _conn():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL не задана!")
+    r = urlparse(DATABASE_URL)
     host = r.hostname or ""
+
     if "railway.internal" in host or host in ("localhost", "127.0.0.1"):
-        ssl_context = None   # внутрішня мережа — без SSL
+        ssl_ctx = None
     else:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ssl_context = ctx
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
 
     params = {
         "host":     host,
@@ -40,20 +36,9 @@ def _parse_url(url: str) -> dict:
         "user":     r.username,
         "password": r.password,
     }
-    if ssl_context is not None:
-        params["ssl_context"] = ssl_context
+    if ssl_ctx is not None:
+        params["ssl_context"] = ssl_ctx
 
-    return params
-
-
-@contextmanager
-def _conn():
-    if not DATABASE_URL:
-        raise ValueError(
-            "Змінна середовища DATABASE_URL не задана!\n"
-            "Додай її у Railway -> Variables."
-        )
-    params = _parse_url(DATABASE_URL)
     con = pg8000.native.Connection(**params)
     try:
         yield con
@@ -68,81 +53,157 @@ def _conn():
         con.close()
 
 
-# ════════════════════════════ ініціалізація ═══════════════════════════
-
 def init_db():
-    """Створює таблицю якщо її ще немає."""
     with _conn() as con:
         con.run("""
             CREATE TABLE IF NOT EXISTS ratings (
-                chat_id         BIGINT  NOT NULL,
-                user_id         BIGINT  NOT NULL,
-                name            TEXT    NOT NULL,
-                games_played    INTEGER NOT NULL DEFAULT 0,
-                games_won       INTEGER NOT NULL DEFAULT 0,
-                total_guessed   INTEGER NOT NULL DEFAULT 0,
-                total_explained INTEGER NOT NULL DEFAULT 0,
-                turns_played    INTEGER NOT NULL DEFAULT 0,
+                chat_id          BIGINT  NOT NULL,
+                user_id          BIGINT  NOT NULL,
+                name             TEXT    NOT NULL,
+                games_played     INTEGER NOT NULL DEFAULT 0,
+                turns_played     INTEGER NOT NULL DEFAULT 0,
+                total_explained  INTEGER NOT NULL DEFAULT 0,
+                total_guessed    INTEGER NOT NULL DEFAULT 0,
+                hearts_received  INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
+        # Додаємо колонку якщо БД стара (без hearts_received)
+        try:
+            con.run("""
+                ALTER TABLE ratings
+                ADD COLUMN IF NOT EXISTS hearts_received INTEGER NOT NULL DEFAULT 0
+            """)
+        except Exception:
+            pass
     logger.info("✅ PostgreSQL: таблиця ratings готова")
 
 
-# ════════════════════════════ запис результатів ═══════════════════════
-
 def save_game_results(chat_id: int, players: list):
-    """Зберігає підсумки гри (UPSERT)."""
+    """UPSERT результатів гри."""
     with _conn() as con:
         for p in players:
             con.run(
                 """
                 INSERT INTO ratings
                     (chat_id, user_id, name,
-                     games_played, games_won,
-                     total_guessed, total_explained, turns_played)
+                     games_played, turns_played,
+                     total_explained, total_guessed, hearts_received)
                 VALUES
                     (:chat_id, :user_id, :name,
-                     :games_played, :games_won,
-                     :total_guessed, :total_explained, :turns_played)
+                     :games_played, :turns_played,
+                     :total_explained, :total_guessed, :hearts_received)
                 ON CONFLICT (chat_id, user_id) DO UPDATE SET
                     name            = EXCLUDED.name,
                     games_played    = ratings.games_played    + EXCLUDED.games_played,
-                    games_won       = ratings.games_won       + EXCLUDED.games_won,
-                    total_guessed   = ratings.total_guessed   + EXCLUDED.total_guessed,
+                    turns_played    = ratings.turns_played    + EXCLUDED.turns_played,
                     total_explained = ratings.total_explained + EXCLUDED.total_explained,
-                    turns_played    = ratings.turns_played    + EXCLUDED.turns_played
+                    total_guessed   = ratings.total_guessed   + EXCLUDED.total_guessed,
+                    hearts_received = ratings.hearts_received + EXCLUDED.hearts_received
                 """,
                 chat_id=chat_id,
                 user_id=p["user_id"],
                 name=p["name"],
                 games_played=1,
-                games_won=1 if p.get("won") else 0,
-                total_guessed=p.get("guessed", 0),
-                total_explained=p.get("explained", 0),
                 turns_played=p.get("turns", 0),
+                total_explained=p.get("explained", 0),
+                total_guessed=p.get("guessed", 0),
+                hearts_received=p.get("hearts", 0),
             )
 
 
-# ════════════════════════════ читання рейтингу ════════════════════════
-
-def get_rating_rows(chat_id: int) -> list:
-    """Повертає список словників відсортований за кількістю вгаданих слів."""
+def get_rating_rows(chat_id: int, limit: int = 25) -> list:
+    """Топ гравців за кількістю вгаданих слів."""
     with _conn() as con:
         rows = con.run(
             """
-            SELECT chat_id, user_id, name,
-                   games_played, games_won,
-                   total_guessed, total_explained, turns_played
+            SELECT user_id, name,
+                   games_played, turns_played,
+                   total_explained, total_guessed, hearts_received
             FROM   ratings
             WHERE  chat_id = :chat_id
-            ORDER  BY total_guessed DESC, games_won DESC
+            ORDER  BY total_guessed DESC
+            LIMIT  :limit
             """,
             chat_id=chat_id,
+            limit=limit,
         )
-        cols = [
-            "chat_id", "user_id", "name",
-            "games_played", "games_won",
-            "total_guessed", "total_explained", "turns_played",
-        ]
+        cols = ["user_id", "name", "games_played", "turns_played",
+                "total_explained", "total_guessed", "hearts_received"]
         return [dict(zip(cols, row)) for row in rows]
+
+
+def get_user_stats(chat_id: int, user_id: int) -> dict | None:
+    """Статистика конкретного гравця в чаті."""
+    with _conn() as con:
+        rows = con.run(
+            """
+            SELECT user_id, name,
+                   games_played, turns_played,
+                   total_explained, total_guessed, hearts_received
+            FROM   ratings
+            WHERE  chat_id = :chat_id AND user_id = :user_id
+            """,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+        if not rows:
+            return None
+        cols = ["user_id", "name", "games_played", "turns_played",
+                "total_explained", "total_guessed", "hearts_received"]
+        return dict(zip(cols, rows[0]))
+
+
+def get_user_stats_all_chats(user_id: int) -> dict | None:
+    """Сумарна статистика гравця по всіх чатах."""
+    with _conn() as con:
+        rows = con.run(
+            """
+            SELECT
+                SUM(games_played)    AS games_played,
+                SUM(turns_played)    AS turns_played,
+                SUM(total_explained) AS total_explained,
+                SUM(total_guessed)   AS total_guessed,
+                SUM(hearts_received) AS hearts_received
+            FROM ratings
+            WHERE user_id = :user_id
+            """,
+            user_id=user_id,
+        )
+        if not rows or rows[0][0] is None:
+            return None
+        cols = ["games_played", "turns_played", "total_explained",
+                "total_guessed", "hearts_received"]
+        return dict(zip(cols, rows[0]))
+
+
+def record_game_results(chat_id: int, game) -> None:
+    """Зберігає підсумки гри в БД."""
+    players = [
+        {
+            "user_id":   p.user_id,
+            "name":      p.name,
+            "turns":     p.turns_played,
+            "explained": p.explained,
+            "guessed":   p.guessed,
+            "hearts":    p.hearts,
+        }
+        for p in game.players.values()
+    ]
+    if players:
+        save_game_results(chat_id, players)
+
+
+def get_rating_text(chat_id: int) -> str:
+    rows = get_rating_rows(chat_id, limit=25)
+    if not rows:
+        return "📊 Рейтингу ще немає — зіграйте хоча б одну гру!"
+
+    lines = [f"🏆 *Топ-{min(len(rows), 25)} гравців*\n"]
+    for i, r in enumerate(rows):
+        lines.append(
+            f"{i + 1}. {r['name']} — "
+            f"*{r['total_guessed']}* відп."
+            + (f"  💚 {r['hearts_received']}" if r["hearts_received"] else "")
+        )
+    return "\n".join(lines)
