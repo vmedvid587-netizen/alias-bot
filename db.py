@@ -12,11 +12,10 @@ import pg8000.native
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
 
 @contextmanager
 def _conn():
+    DATABASE_URL = os.environ.get("DATABASE_URL", "")
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL не задана!")
     r = urlparse(DATABASE_URL)
