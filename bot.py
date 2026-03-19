@@ -442,12 +442,42 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     aw.exclusive_uid = user.id
     aw.exclusive_until = time.time() + VOLUNTEER_EXCL_SEC
 
+    # Зберігаємо дані реакції — потрібні для кнопки 💚
+    explainer_id_for_hearts = aw.explainer_id
+    context.bot_data[f"last_reaction_{chat_id}"] = {
+        "explainer_id":  explainer_id_for_hearts,
+        "exp_name":      exp_name,
+        "hearts_count":  0,
+        "exclusive_uid": user.id,
+        "exclusive_until": time.time() + VOLUNTEER_EXCL_SEC,
+    }
+
+    # Зберігаємо очко відразу в БД (рейтинг оновлюється після кожного слова)
+    from db import save_game_results as _save
+    _save(chat_id, [{
+        "user_id":   user.id,
+        "name":      guesser_name,
+        "turns":     0,
+        "explained": 0,
+        "guessed":   1,
+        "hearts":    0,
+    }])
+    if explainer:
+        _save(chat_id, [{
+            "user_id":   explainer.user_id,
+            "name":      explainer.name,
+            "turns":     0,
+            "explained": 1,
+            "guessed":   0,
+            "hearts":    0,
+        }])
+
     # Реакція
     reaction_msg = await context.bot.send_message(
         chat_id,
         f"🎉 *{guesser_name}* відгадав(-ла) слово *{guessed_word.upper()}*\n\n"
         f"Постав 💚 ведучому *{exp_name}*, якщо пояснення сподобалось",
-        reply_markup=_reaction_keyboard(chat_id, aw.hearts_count, exp_name),
+        reply_markup=_reaction_keyboard(chat_id, 0, exp_name),
         parse_mode=ParseMode.MARKDOWN,
     )
     aw.reaction_msg_id = reaction_msg.message_id
@@ -500,19 +530,11 @@ async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if aw.card_msg_id:
             await _remove_kb(context, chat_id, aw.card_msg_id)
 
-        explainer = game.players.get(aw.explainer_id)
         exp_id = aw.explainer_id
-
-        await context.bot.send_message(
-            chat_id,
-            f"⏭ *{explainer.name if explainer else '?'}* пропустив слово *{aw.word.upper()}*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
         game.active_word = None
         game.state = GameState.IDLE
 
-        # Той самий ведучий бере наступне слово одразу
+        # Тихо беремо наступне слово — чат не бачить що слово скіпнули
         await _give_word(context, chat_id, exp_id)
 
 
@@ -558,23 +580,31 @@ async def cb_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         given_set.add(q.from_user.id)
 
-        # Нараховуємо серце ведучому
+        # Нараховуємо серце ведучому в пам'яті
         exp_player = game.players.get(explainer_id)
-        if not exp_player:
-            # Гравець міг не потрапити ще в players якщо гра оновилась
-            pass
-        else:
+        if exp_player:
             exp_player.hearts += 1
 
         count = rdata.get("hearts_count", 0) + 1
         rdata["hearts_count"] = count
         context.bot_data[key] = rdata
 
+        # Зберігаємо серце в БД одразу
+        from db import save_game_results as _save
+        exp_name_for_save = rdata.get("exp_name", "ведучий")
+        _save(chat_id, [{
+            "user_id":   explainer_id,
+            "name":      exp_name_for_save,
+            "turns":     0,
+            "explained": 0,
+            "guessed":   0,
+            "hearts":    1,
+        }])
+
         await q.answer("💚 Дякуємо!")
-        exp_name = rdata.get("exp_name", "ведучий")
         try:
             await q.edit_message_reply_markup(
-                reply_markup=_reaction_keyboard(chat_id, count, exp_name)
+                reply_markup=_reaction_keyboard(chat_id, count, exp_name_for_save)
             )
         except BadRequest:
             pass
