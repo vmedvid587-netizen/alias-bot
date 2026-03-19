@@ -1,11 +1,12 @@
 """
 Постійне сховище рейтингів у PostgreSQL (Supabase).
-Використовує pg8000 — чистий Python, без системних залежностей.
+Використовує pg8000 через Supabase connection pooler (порт 6543).
 """
 
 import os
+import ssl
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from contextlib import contextmanager
 
 import pg8000.native
@@ -20,13 +21,24 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 def _parse_url(url: str) -> dict:
     """Розбирає DATABASE_URL на параметри для pg8000."""
     r = urlparse(url)
+    # Supabase connection pooler працює на порту 6543
+    # Прямий порт 5432 часто блокується файрволами
+    port = r.port or 5432
+    if port == 5432:
+        port = 6543
+
+    # SSL контекст для Supabase
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
     return {
         "host":        r.hostname,
-        "port":        r.port or 5432,
+        "port":        port,
         "database":    r.path.lstrip("/"),
         "user":        r.username,
         "password":    r.password,
-        "ssl_context": True,   # Supabase вимагає SSL
+        "ssl_context": ctx,
     }
 
 
@@ -44,7 +56,10 @@ def _conn():
         yield con
         con.run("COMMIT")
     except Exception:
-        con.run("ROLLBACK")
+        try:
+            con.run("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         con.close()
