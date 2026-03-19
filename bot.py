@@ -26,7 +26,6 @@ from db import (
     init_db, record_game_results,
     get_rating_text, get_user_stats, get_user_stats_all_chats,
 )
-from words import WORDS
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -271,49 +270,14 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game = create_game(chat.id, user.id)
     game.ensure_player(user.id, uname(user))
 
-    # Вибір категорії
-    cats = list(WORDS.keys())
-    context.bot_data[f"cats_{chat.id}"] = cats + [None]
-    rows, row = [], []
-    for i, c in enumerate(cats):
-        row.append(InlineKeyboardButton(c, callback_data=f"C_{i}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("🔀 Всі категорії", callback_data=f"C_{len(cats)}")])
-
     await update.message.reply_text(
-        f"🎮 *{uname(user)} створює гру Еліас!*\n\nОбери категорію слів:",
-        reply_markup=InlineKeyboardMarkup(rows),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cb_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    chat_id = q.message.chat_id
-    game = get_game(chat_id)
-    if not game:
-        return
-    if q.from_user.id != game.creator_id:
-        await q.answer("Тільки засновник обирає!", show_alert=True)
-        return
-
-    idx = int(q.data.split("_", 1)[1])
-    cats = context.bot_data.get(f"cats_{chat_id}", [])
-    game.category = cats[idx] if idx < len(cats) else None
-    cat_label = game.category or "🔀 Всі категорії"
-
-    await q.edit_message_text(
-        f"🗣 *Гра Еліас готується!*\n\n"
-        f"📚 Категорія: *{cat_label}*\n\n"
-        f"Засновник починає: /startgame\n"
+        f"🗣 *{uname(user)} створює гру Еліас!*\n\n"
+        "Засновник починає: /startgame\n"
         "_Просто пишіть варіанти в чат — приєднання автоматичне!_",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
 
 
 # ═════════════════════════ /startgame ═══════════════════════════════
@@ -337,7 +301,6 @@ async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🚀 *Гра Еліас починається!*\n\n"
-        f"📚 *{game.category or 'Всі категорії'}*\n\n"
         f"Перше слово пояснює *{uname(user)}*!",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -526,7 +489,7 @@ async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # VIEW
     if action == "view":
-        await q.answer(f"🔤 {aw.word.upper()}\n📚 {aw.category}", show_alert=True)
+        await q.answer(f"🔤 {aw.word.upper()}", show_alert=True)
         return
 
     # SKIP
@@ -770,7 +733,6 @@ def main():
     app.add_handler(CommandHandler("mystats",   cmd_mystats))
     app.add_handler(CommandHandler("endgame",   cmd_endgame))
 
-    app.add_handler(CallbackQueryHandler(cb_category,      pattern=r"^C_"))
     app.add_handler(CallbackQueryHandler(cb_volunteer_take, pattern=r"^V_take_"))
     app.add_handler(CallbackQueryHandler(cb_explainer,     pattern=r"^E_"))
     app.add_handler(CallbackQueryHandler(cb_reaction,      pattern=r"^R_"))
