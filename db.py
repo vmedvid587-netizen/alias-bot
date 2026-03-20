@@ -53,8 +53,12 @@ def _conn():
 
 
 def init_db():
-    with _conn() as con:
-        con.run("""
+    if not os.environ.get("DATABASE_URL"):
+        logger.warning("⚠️  DATABASE_URL не задана — рейтинг не зберігатиметься")
+        return
+    try:
+        with _conn() as con:
+            con.run("""
             CREATE TABLE IF NOT EXISTS ratings (
                 chat_id          BIGINT  NOT NULL,
                 user_id          BIGINT  NOT NULL,
@@ -75,11 +79,16 @@ def init_db():
             """)
         except Exception:
             pass
+    except Exception as e:
+        logger.warning(f"⚠️  БД недоступна: {e} — рейтинг не зберігатиметься")
+        return
     logger.info("✅ PostgreSQL: таблиця ratings готова")
 
 
 def save_game_results(chat_id: int, players: list):
     """UPSERT результатів гри."""
+    if not os.environ.get("DATABASE_URL"):
+        return
     with _conn() as con:
         for p in players:
             con.run(
@@ -113,6 +122,8 @@ def save_game_results(chat_id: int, players: list):
 
 def get_rating_rows(chat_id: int, limit: int = 25) -> list:
     """Топ гравців за кількістю вгаданих слів."""
+    if not os.environ.get("DATABASE_URL"):
+        return []
     with _conn() as con:
         rows = con.run(
             """
@@ -134,6 +145,8 @@ def get_rating_rows(chat_id: int, limit: int = 25) -> list:
 
 def get_user_stats(chat_id: int, user_id: int) -> dict | None:
     """Статистика конкретного гравця в чаті."""
+    if not os.environ.get("DATABASE_URL"):
+        return None
     with _conn() as con:
         rows = con.run(
             """
@@ -155,6 +168,8 @@ def get_user_stats(chat_id: int, user_id: int) -> dict | None:
 
 def get_user_stats_all_chats(user_id: int) -> dict | None:
     """Сумарна статистика гравця по всіх чатах."""
+    if not os.environ.get("DATABASE_URL"):
+        return None
     with _conn() as con:
         rows = con.run(
             """
