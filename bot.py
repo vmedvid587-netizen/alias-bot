@@ -627,7 +627,7 @@ async def cb_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_score(update: Update, _: ContextTypes.DEFAULT_TYPE):
     game = get_game(update.effective_chat.id)
-    if not game or game.state == GameState.WAITING:
+    if not game:
         await update.message.reply_text("⚠️ Немає активної гри.")
         return
     text = game.get_scoreboard()
