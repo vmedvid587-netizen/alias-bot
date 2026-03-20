@@ -320,8 +320,9 @@ async def _give_word(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     explainer_id: int,
+    existing_card_msg_id: int = None,
 ):
-    """Видає нове слово ведучому і публікує картку в чат."""
+    """Видає нове слово. Якщо existing_card_msg_id — редагує картку, інакше надсилає нову."""
     game = get_game(chat_id)
     if not game:
         return
@@ -339,14 +340,27 @@ async def _give_word(
 
     explainer = game.players.get(explainer_id)
 
-    # Картка в груповому чаті (слово НЕ показуємо)
-    card_msg = await context.bot.send_message(
-        chat_id,
-        _card_text(game, aw),
-        reply_markup=_explainer_keyboard(chat_id),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    aw.card_msg_id = card_msg.message_id
+    # Картка в груповому чаті — редагуємо існуючу або надсилаємо нову
+    if existing_card_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=existing_card_msg_id,
+                text=_card_text(game, aw),
+                reply_markup=_explainer_keyboard(chat_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            aw.card_msg_id = existing_card_msg_id
+        except Exception:
+            existing_card_msg_id = None
+    if not existing_card_msg_id:
+        card_msg = await context.bot.send_message(
+            chat_id,
+            _card_text(game, aw),
+            reply_markup=_explainer_keyboard(chat_id),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        aw.card_msg_id = card_msg.message_id
 
     # Слово ведучий бачить через кнопку 👁 у груповому чаті
 
@@ -486,15 +500,13 @@ async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("⏭ Беремо нове слово")
         _cancel_jobs(context, f"word_{chat_id}")
 
-        if aw.card_msg_id:
-            await _remove_kb(context, chat_id, aw.card_msg_id)
-
+        old_card_id = aw.card_msg_id
         exp_id = aw.explainer_id
         game.active_word = None
         game.state = GameState.IDLE
 
-        # Тихо беремо наступне слово — чат не бачить що слово скіпнули
-        await _give_word(context, chat_id, exp_id)
+        # Тихо редагуємо існуючу картку — нового повідомлення немає
+        await _give_word(context, chat_id, exp_id, existing_card_msg_id=old_card_id)
 
 
 # ════════════════════════ Кнопки реакцій (R_*) ══════════════════════
