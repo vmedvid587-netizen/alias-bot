@@ -34,7 +34,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WORD_TIMEOUT      = 10 * 60   # 10 хвилин без вгаданого слова — сесія завершується
-NO_EXPLAINER_TIMEOUT = 5 * 60 # 5 хвилин без ведучого — сесія завершується
 VOLUNTEER_EXCL_SEC = 30        # секунд ексклюзивного вікна для відгадувача
 
 
@@ -56,7 +55,10 @@ def _cancel_jobs(context: ContextTypes.DEFAULT_TYPE, name: str):
 
 def _start_word_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, word: str):
     """Запускає таймер на 10 хвилин для поточного слова."""
-    _cancel_jobs(context, f"word_{chat_id}")
+    # Скасовуємо ВСІ існуючі word-таймери для цього чату
+    for job in context.application.job_queue.jobs():
+        if job.name and job.name.startswith(f"word_{chat_id}"):
+            job.schedule_removal()
     context.application.job_queue.run_once(
         _word_timeout_cb,
         WORD_TIMEOUT,
@@ -118,21 +120,6 @@ async def _word_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def _no_explainer_cb(context: ContextTypes.DEFAULT_TYPE):
-    """5 хвилин ніхто не взяв слово — завершуємо сесію."""
-    chat_id = context.job.data["chat_id"]
-    game = get_game(chat_id)
-    if not game or game.state != GameState.IDLE:
-        return
-
-    await context.bot.send_message(
-        chat_id,
-        "😴 *Ніхто не взяв слово протягом 5 хвилин — сесію завершено!*\n\n"
-        + game.get_scoreboard(),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    game.state = GameState.FINISHED
-    delete_game(chat_id)
 
 
 # ══════════════════════════ клавіатури ══════════════════════════════
@@ -282,14 +269,6 @@ async def _ask_for_volunteer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         )
         context.bot_data[vol_key] = msg.message_id
 
-    # Таймер: якщо ніхто не взяв — завершити
-    _cancel_jobs(context, f"noexplainer_{chat_id}")
-    context.application.job_queue.run_once(
-        _no_explainer_cb,
-        NO_EXPLAINER_TIMEOUT,
-        data={"chat_id": chat_id},
-        name=f"noexplainer_{chat_id}",
-    )
 
 
 async def cb_volunteer_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,7 +288,6 @@ async def cb_volunteer_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game.state = GameState.EXPLAINING
 
     # Скасовуємо таймер очікування ведучого
-    _cancel_jobs(context, f"noexplainer_{chat_id}")
     context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
 
     await q.edit_message_reply_markup(None)
@@ -612,7 +590,6 @@ async def cb_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game.state = GameState.EXPLAINING
 
         # Скасовуємо таймер очікування ведучого
-        _cancel_jobs(context, f"noexplainer_{chat_id}")
         context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
         await q.edit_message_reply_markup(None)
         await _give_word(context, chat_id, uid)
@@ -694,7 +671,7 @@ async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Немає активної гри.")
         return
 
-    for job_name in [f"word_{chat_id}", f"inactive_{chat_id}", f"noexplainer_{chat_id}"]:
+    for job_name in [f"word_{chat_id}", f"inactive_{chat_id}"]:
         _cancel_jobs(context, job_name)
 
     aw = game.active_word
