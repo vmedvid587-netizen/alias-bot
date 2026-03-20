@@ -104,7 +104,6 @@ async def _word_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
     if aw.reaction_msg_id:
         await _remove_kb(context, chat_id, aw.reaction_msg_id)
 
-    record_game_results(chat_id, game)
     await context.bot.send_message(
         chat_id,
         f"⏰ *10 хвилин без вгаданих слів — сесію завершено!*\n\n"
@@ -126,7 +125,6 @@ async def _no_explainer_cb(context: ContextTypes.DEFAULT_TYPE):
     if not game or game.state != GameState.IDLE:
         return
 
-    record_game_results(chat_id, game)
     await context.bot.send_message(
         chat_id,
         "😴 *Ніхто не взяв слово протягом 5 хвилин — сесію завершено!*\n\n"
@@ -330,7 +328,6 @@ async def _give_word(
 
     aw = game.start_word(explainer_id)
     if not aw:
-        record_game_results(chat_id, game)
         await context.bot.send_message(
             chat_id,
             "😱 Слова скінчились! Гра завершена!\n\n" + game.get_scoreboard(),
@@ -697,7 +694,6 @@ async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if aw and aw.card_msg_id:
         await _remove_kb(context, chat_id, aw.card_msg_id)
 
-    record_game_results(chat_id, game)
     await update.message.reply_text(
         "🛑 *Гру завершено!*\n\n" + game.get_scoreboard(),
         parse_mode=ParseMode.MARKDOWN,
