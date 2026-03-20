@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-
+from telegram.request import HTTPXRequest
 from game import (
     Game, GameState, ActiveWord,
     get_game, create_game, delete_game,
