@@ -340,15 +340,13 @@ async def _give_word(
 
     explainer = game.players.get(explainer_id)
 
-    # Картка в груповому чаті — редагуємо існуючу або надсилаємо нову
+    # Картка в груповому чаті — при скіпі оновлюємо тільки клавіатуру (текст не змінився)
     if existing_card_msg_id:
         try:
-            await context.bot.edit_message_text(
+            await context.bot.edit_message_reply_markup(
                 chat_id=chat_id,
                 message_id=existing_card_msg_id,
-                text=_card_text(game, aw),
                 reply_markup=_explainer_keyboard(chat_id),
-                parse_mode=ParseMode.MARKDOWN,
             )
             aw.card_msg_id = existing_card_msg_id
         except Exception:
