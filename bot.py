@@ -695,8 +695,7 @@ def main():
     init_db()
     logger.info("✅ База даних готова")
 request_config = HTTPXRequest(connect_timeout=20, read_timeout=20)
-    app = Application.builder().token(token).request(request_config).build()
-
+app = (Application.builder().token(token).request(request_config).build()
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("newgame",   cmd_newgame))
