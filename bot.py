@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.request import HTTPXRequest
+
 from game import (
     Game, GameState, ActiveWord,
     get_game, create_game, delete_game,
@@ -694,8 +694,9 @@ def main():
 
     init_db()
     logger.info("✅ База даних готова")
-request_config = HTTPXRequest(connect_timeout=20, read_timeout=20)
-app = (Application.builder().token(token).request(request_config).build()
+
+    app = Application.builder().token(token).build()
+
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("newgame",   cmd_newgame))
