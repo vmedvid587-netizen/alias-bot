@@ -340,18 +340,10 @@ async def _give_word(
 
     explainer = game.players.get(explainer_id)
 
-    # Картка в груповому чаті — при скіпі оновлюємо тільки клавіатуру (текст не змінився)
+    # При скіпі — просто запам'ятовуємо існуючу картку, не надсилаємо нову
     if existing_card_msg_id:
-        try:
-            await context.bot.edit_message_reply_markup(
-                chat_id=chat_id,
-                message_id=existing_card_msg_id,
-                reply_markup=_explainer_keyboard(chat_id),
-            )
-            aw.card_msg_id = existing_card_msg_id
-        except Exception:
-            existing_card_msg_id = None
-    if not existing_card_msg_id:
+        aw.card_msg_id = existing_card_msg_id
+    else:
         card_msg = await context.bot.send_message(
             chat_id,
             _card_text(game, aw),
@@ -495,7 +487,6 @@ async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # SKIP
     if action == "skip":
-        await q.answer("⏭ Беремо нове слово")
         _cancel_jobs(context, f"word_{chat_id}")
 
         old_card_id = aw.card_msg_id
@@ -503,8 +494,14 @@ async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game.active_word = None
         game.state = GameState.IDLE
 
-        # Тихо редагуємо існуючу картку — нового повідомлення немає
         await _give_word(context, chat_id, exp_id, existing_card_msg_id=old_card_id)
+
+        # Показуємо нове слово у спливному вікні ведучому
+        new_aw = game.active_word
+        if new_aw:
+            await q.answer(f"🔤 {new_aw.word.upper()}", show_alert=True)
+        else:
+            await q.answer("⏭")
 
 
 # ════════════════════════ Кнопки реакцій (R_*) ══════════════════════
