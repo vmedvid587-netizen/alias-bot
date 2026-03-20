@@ -694,8 +694,8 @@ def main():
 
     init_db()
     logger.info("✅ База даних готова")
-
-    app = Application.builder().token(token).build()
+request_config = HTTPXRequest(connect_timeout=20, read_timeout=20)
+    app = Application.builder().token(token).request(request_config).build()
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
