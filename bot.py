@@ -33,8 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WORD_TIMEOUT      = 10 * 60   # 10 хвилин — слово скипується якщо ніхто не вгадав
-INACTIVITY_TIMEOUT = 20 * 60  # 20 хвилин без вгаданих слів — сесія завершується
+WORD_TIMEOUT      = 10 * 60   # 10 хвилин без вгаданого слова — сесія завершується
 NO_EXPLAINER_TIMEOUT = 5 * 60 # 5 хвилин без ведучого — сесія завершується
 VOLUNTEER_EXCL_SEC = 30        # секунд ексклюзивного вікна для відгадувача
 
@@ -53,15 +52,6 @@ def _cancel_jobs(context: ContextTypes.DEFAULT_TYPE, name: str):
         job.schedule_removal()
 
 
-def _reset_inactivity(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Скидає таймер бездіяльності після кожного вгаданого слова."""
-    _cancel_jobs(context, f"inactive_{chat_id}")
-    context.application.job_queue.run_once(
-        _inactivity_cb,
-        INACTIVITY_TIMEOUT,
-        data={"chat_id": chat_id},
-        name=f"inactive_{chat_id}",
-    )
 
 
 def _start_word_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, word: str):
@@ -114,7 +104,6 @@ async def _word_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
     if aw.reaction_msg_id:
         await _remove_kb(context, chat_id, aw.reaction_msg_id)
 
-    _cancel_jobs(context, f"inactive_{chat_id}")
     record_game_results(chat_id, game)
     await context.bot.send_message(
         chat_id,
@@ -128,29 +117,6 @@ async def _word_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
     delete_game(chat_id)
 
 
-async def _inactivity_cb(context: ContextTypes.DEFAULT_TYPE):
-    """20 хвилин без вгаданих слів — завершуємо сесію."""
-    chat_id = context.job.data["chat_id"]
-    game = get_game(chat_id)
-    if not game or game.state == GameState.FINISHED:
-        return
-
-    _cancel_jobs(context, f"word_{chat_id}")
-    _cancel_jobs(context, f"noexplainer_{chat_id}")
-
-    aw = game.active_word
-    if aw and aw.card_msg_id:
-        await _remove_kb(context, chat_id, aw.card_msg_id)
-
-    record_game_results(chat_id, game)
-    await context.bot.send_message(
-        chat_id,
-        "😴 *20 хвилин без вгаданих слів — сесію завершено!*\n\n"
-        + game.get_scoreboard(),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    game.state = GameState.FINISHED
-    delete_game(chat_id)
 
 
 async def _no_explainer_cb(context: ContextTypes.DEFAULT_TYPE):
@@ -160,7 +126,6 @@ async def _no_explainer_cb(context: ContextTypes.DEFAULT_TYPE):
     if not game or game.state != GameState.IDLE:
         return
 
-    _cancel_jobs(context, f"inactive_{chat_id}")
     record_game_results(chat_id, game)
     await context.bot.send_message(
         chat_id,
@@ -228,7 +193,6 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "Додай мене до групового чату і пиши /newgame!\n\n"
         "📋 *Команди:*\n"
         "/newgame — нова гра\n"
-        "/startgame — почати гру\n"
         "/score — рахунок\n"
         "/rating — топ-25 гравців\n"
         "/mystats — моя статистика\n"
@@ -269,34 +233,6 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     game = create_game(chat.id, user.id)
     game.ensure_player(user.id, uname(user))
-
-    await update.message.reply_text(
-        f"🗣 *{uname(user)} створює гру Еліас!*\n\n"
-        "Засновник починає: /startgame\n"
-        "_Просто пишіть варіанти в чат — приєднання автоматичне!_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-
-
-# ═════════════════════════ /startgame ═══════════════════════════════
-
-async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    game = get_game(chat_id)
-
-    if not game:
-        await update.message.reply_text("⚠️ Немає гри.")
-        return
-    if user.id != game.creator_id:
-        await update.message.reply_text("⚠️ Тільки засновник може почати!")
-        return
-    if game.state != GameState.WAITING:
-        await update.message.reply_text("⚠️ Гра вже розпочата!")
-        return
-
     game.state = GameState.IDLE
 
     await update.message.reply_text(
@@ -304,25 +240,49 @@ async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Перше слово пояснює *{uname(user)}*!",
         parse_mode=ParseMode.MARKDOWN,
     )
-    # Засновник автоматично отримує перше слово
-    await _give_word(context, chat_id, user.id)
+    await _give_word(context, chat.id, user.id)
+
+
+
+
 
 
 # ══════════════════════════ ведучий ═════════════════════════════════
 
 async def _ask_for_volunteer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Публікує кнопку 'Хочу пояснювати' і запускає таймер очікування."""
+    """Публікує або оновлює кнопку 'Хочу пояснювати'."""
     game = get_game(chat_id)
     if not game or game.state == GameState.FINISHED:
         return
 
-    await context.bot.send_message(
-        chat_id,
+    text = (
         "🎯 *Хто буде пояснювати наступне слово?*\n"
-        "_Натисни кнопку нижче!_",
-        reply_markup=_volunteer_keyboard(chat_id),
-        parse_mode=ParseMode.MARKDOWN,
+        "_Натисни кнопку нижче!_"
     )
+    vol_key = f"volunteer_msg_{chat_id}"
+    existing_id = context.bot_data.get(vol_key)
+
+    if existing_id:
+        # Оновлюємо існуюче повідомлення замість нового
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=existing_id,
+                text=text,
+                reply_markup=_volunteer_keyboard(chat_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            existing_id = None  # не вдалось — публікуємо нове
+
+    if not existing_id:
+        msg = await context.bot.send_message(
+            chat_id,
+            text,
+            reply_markup=_volunteer_keyboard(chat_id),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        context.bot_data[vol_key] = msg.message_id
 
     # Таймер: якщо ніхто не взяв — завершити
     _cancel_jobs(context, f"noexplainer_{chat_id}")
@@ -345,10 +305,14 @@ async def cb_volunteer_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = q.from_user
-    player = game.ensure_player(user.id, uname(user))
+    game.ensure_player(user.id, uname(user))
+
+    # Блокуємо стан одразу щоб інші натискання не пройшли
+    game.state = GameState.EXPLAINING
 
     # Скасовуємо таймер очікування ведучого
     _cancel_jobs(context, f"noexplainer_{chat_id}")
+    context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
 
     await q.edit_message_reply_markup(None)
     await _give_word(context, chat_id, user.id)
@@ -391,7 +355,6 @@ async def _give_word(
 
     # Таймер 10 хвилин на слово
     _start_word_timer(context, chat_id, aw.word)
-    _reset_inactivity(context, chat_id)
 
 
 # ═══════════════════════ Авто-детекція відповіді ════════════════════
@@ -432,7 +395,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Скасовуємо таймер слова
     _cancel_jobs(context, f"word_{chat_id}")
-    _reset_inactivity(context, chat_id)
 
     # Прибираємо кнопки з картки
     if aw.card_msg_id:
@@ -642,8 +604,12 @@ async def cb_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Зараз хтось пояснює — зачекай!", show_alert=True)
             return
 
+        # Блокуємо стан одразу щоб інші натискання не пройшли
+        game.state = GameState.EXPLAINING
+
         # Скасовуємо таймер очікування ведучого
         _cancel_jobs(context, f"noexplainer_{chat_id}")
+        context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
         await q.edit_message_reply_markup(None)
         await _give_word(context, chat_id, uid)
 
@@ -723,9 +689,6 @@ async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not game:
         await update.message.reply_text("⚠️ Немає активної гри.")
         return
-    if user.id != game.creator_id:
-        await update.message.reply_text("⚠️ Тільки засновник може завершити гру!")
-        return
 
     for job_name in [f"word_{chat_id}", f"inactive_{chat_id}", f"noexplainer_{chat_id}"]:
         _cancel_jobs(context, job_name)
@@ -757,7 +720,6 @@ def main():
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("newgame",   cmd_newgame))
-    app.add_handler(CommandHandler("startgame", cmd_startgame))
     app.add_handler(CommandHandler("score",     cmd_score))
     app.add_handler(CommandHandler("rating",    cmd_rating))
     app.add_handler(CommandHandler("mystats",   cmd_mystats))
@@ -775,7 +737,6 @@ def main():
     async def post_init(a):
         await a.bot.set_my_commands([
             BotCommand("newgame",   "Нова гра"),
-            BotCommand("startgame", "Почати гру"),
             BotCommand("score",     "Рахунок"),
             BotCommand("rating",    "Топ-25 гравців"),
             BotCommand("mystats",   "Моя статистика"),
