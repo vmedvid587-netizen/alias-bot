@@ -92,10 +92,12 @@ async def _word_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
     chat_id, expired_word = d["chat_id"], d["word"]
     game = get_game(chat_id)
+    logger.info(f"⏰ word_timeout fired: chat={chat_id} word={expired_word} state={game.state if game else 'NO_GAME'}")
     if not game or game.state != GameState.EXPLAINING:
         return
     aw = game.active_word
     if not aw or aw.word != expired_word:
+        logger.info(f"⏰ word_timeout ignored: aw.word={aw.word if aw else 'None'} expired={expired_word}")
         return
 
     explainer = game.players.get(aw.explainer_id)
@@ -142,6 +144,16 @@ def _reaction_keyboard(chat_id: int, hearts: int, exp_name: str) -> InlineKeyboa
         [InlineKeyboardButton(
             "🖐 Хочу пояснювати!",
             callback_data=f"R_volunteer_{chat_id}",
+        )],
+    ])
+
+
+def _heart_only_keyboard(chat_id: int, hearts: int, exp_name: str) -> InlineKeyboardMarkup:
+    """Тільки кнопка серця — після того як хтось взяв слово."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💚 {hearts}  — дякую {exp_name}!",
+            callback_data=f"R_heart_{chat_id}",
         )],
     ])
 
@@ -219,6 +231,9 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game = create_game(chat.id, user.id)
     game.ensure_player(user.id, uname(user))
     game.state = GameState.IDLE
+    # Чистимо стан попередньої гри
+    context.bot_data.pop(f"volunteer_msg_{chat.id}", None)
+    context.bot_data.pop(f"last_reaction_{chat.id}", None)
 
     await update.message.reply_text(
         f"🚀 *Гра Еліас починається!*\n\n"
@@ -258,7 +273,8 @@ async def _ask_for_volunteer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
-            existing_id = None  # не вдалось — публікуємо нове
+            existing_id = None
+            context.bot_data.pop(vol_key, None)  # скидаємо застарілий id
 
     if not existing_id:
         msg = await context.bot.send_message(
@@ -290,7 +306,17 @@ async def cb_volunteer_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Скасовуємо таймер очікування ведучого
     context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
 
-    await q.edit_message_reply_markup(None)
+    # Залишаємо кнопку 💚 — прибираємо тільки 🖐
+    rdata = context.bot_data.get(f"last_reaction_{chat_id}", {})
+    hearts_count = rdata.get("hearts_count", 0)
+    exp_name_r = rdata.get("exp_name", "ведучий")
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=_heart_only_keyboard(chat_id, hearts_count, exp_name_r)
+        )
+    except Exception:
+        pass
+
     await _give_word(context, chat_id, user.id)
 
 
@@ -317,6 +343,19 @@ async def _give_word(
         return
 
     explainer = game.players.get(explainer_id)
+    # Рахуємо хід тільки при першому слові (не при скіпі)
+    if not existing_card_msg_id and explainer:
+        explainer.turns_played += 1
+        # Зберігаємо в БД одразу
+        from db import save_game_results as _save
+        _save(chat_id, [{
+            "user_id":   explainer_id,
+            "name":      explainer.name,
+            "turns":     1,
+            "explained": 0,
+            "guessed":   0,
+            "hearts":    0,
+        }])
 
     # При скіпі — просто запам'ятовуємо існуючу картку, не надсилаємо нову
     if existing_card_msg_id:
@@ -440,14 +479,11 @@ async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = int(cid_str)
     game = get_game(chat_id)
 
-    if not game or game.state != GameState.EXPLAINING:
+    if not game or game.state != GameState.EXPLAINING or not game.active_word:
         await q.answer("Слово вже неактивне!", show_alert=True)
         return
 
     aw = game.active_word
-    if not aw:
-        await q.answer()
-        return
 
     if q.from_user.id != aw.explainer_id:
         explainer = game.players.get(aw.explainer_id)
@@ -591,7 +627,18 @@ async def cb_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Скасовуємо таймер очікування ведучого
         context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
-        await q.edit_message_reply_markup(None)
+
+        # Залишаємо кнопку 💚 — прибираємо тільки 🖐
+        rdata = context.bot_data.get(f"last_reaction_{chat_id}", {})
+        hearts_count = rdata.get("hearts_count", 0)
+        exp_name_r = rdata.get("exp_name", "ведучий")
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=_heart_only_keyboard(chat_id, hearts_count, exp_name_r)
+            )
+        except Exception:
+            pass
+
         await _give_word(context, chat_id, uid)
 
 
