@@ -312,6 +312,15 @@ WORDS: dict[str, list[str]] = {
 }
 
 # ──────────────────────────────────────────────────────────────────
+# Великий автоматично зібраний словник (див. words_extra.py).
+# Слова, які вже є в тематичних категоріях, не дублюються.
+from words_extra import EXTRA_WORDS
+
+_seen = {w.lower() for ws in WORDS.values() for w in ws}
+for _cat, _ws in EXTRA_WORDS.items():
+    WORDS[_cat] = [w for w in _ws if w.lower() not in _seen]
+    _seen.update(WORDS[_cat])
+
 ALL_WORDS: list[tuple[str, str]] = [
     (word, cat)
     for cat, words in WORDS.items()

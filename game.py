@@ -91,9 +91,7 @@ class Game:
             category=category,
         )
         self.state = GameState.EXPLAINING
-        p = self.players.get(explainer_id)
-        if p:
-            p.turns_played += 1
+        # turns_played рахується в bot._give_word (лише для нового ходу, не для скіпу)
         return self.active_word
 
     # ── таблиця ─────────────────────────────────────────────────────
@@ -107,14 +105,24 @@ class Game:
         for i, p in enumerate(ranked):
             medal = medals[i] if i < 3 else f"  {i + 1}."
             hearts = f"  💚 {p.hearts}" if p.hearts else ""
-            lines.append(f"{medal} *{p.name}* — {p.score} відп.{hearts}")
+            lines.append(f"{medal} *{md(p.name)}* — {p.score} відп.{hearts}")
         return "\n".join(lines)
 
 
 # ════════════════════════════ нормалізація ════════════════════════════
 
+# Різні варіанти апострофа (iOS/Android/Windows-клавіатури) → звичайний '
+_APOSTROPHES = str.maketrans({"’": "'", "ʼ": "'", "‘": "'", "`": "'", "´": "'"})
+
+
+def md(text: str) -> str:
+    """Екранує спецсимволи Telegram Markdown (v1) у користувацьких іменах."""
+    return re.sub(r"([_*`\[])", r"\\\1", str(text))
+
+
 def normalize(text: str) -> str:
-    cleaned = re.sub(r"[^\w'\-]", " ", text.lower())
+    text = text.lower().translate(_APOSTROPHES).replace("ё", "е")
+    cleaned = re.sub(r"[^\w'\-]", " ", text)
     return " ".join(cleaned.split())
 
 
