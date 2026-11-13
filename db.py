@@ -73,18 +73,25 @@ def init_db():
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
-        # Додаємо колонку якщо БД стара (без hearts_received)
-        try:
+            # Додаємо колонку якщо БД стара (без hearts_received).
+            # Раніше цей запит виконувався вже ПІСЛЯ закриття з'єднання
+            # (через відступ) і тихо падав — колонка так і не додавалась.
             con.run("""
                 ALTER TABLE ratings
                 ADD COLUMN IF NOT EXISTS hearts_received INTEGER NOT NULL DEFAULT 0
             """)
-        except Exception:
-            pass
+            # Групи, в які додано бота — для адмін-команд /chats і /say
+            con.run("""
+                CREATE TABLE IF NOT EXISTS chats (
+                    chat_id    BIGINT PRIMARY KEY,
+                    title      TEXT        NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
     except Exception as e:
         logger.warning(f"⚠️  БД недоступна: {e} — рейтинг не зберігатиметься")
         return
-    logger.info("✅ PostgreSQL: таблиця ratings готова")
+    logger.info("✅ PostgreSQL: таблиці ratings і chats готові")
 
 
 def save_game_results(chat_id: int, players: list):
@@ -223,3 +230,34 @@ def get_rating_text(chat_id: int) -> str:
             + (f"  💚 {r['hearts_received']}" if r["hearts_received"] else "")
         )
     return "\n".join(lines)
+
+
+# ════════════════════════════ групи бота ═════════════════════════════
+
+def upsert_chat(chat_id: int, title: str) -> None:
+    if not os.environ.get("DATABASE_URL"):
+        return
+    with _conn() as con:
+        con.run(
+            """
+            INSERT INTO chats (chat_id, title) VALUES (:chat_id, :title)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title, updated_at = now()
+            """,
+            chat_id=chat_id, title=title,
+        )
+
+
+def delete_chat(chat_id: int) -> None:
+    if not os.environ.get("DATABASE_URL"):
+        return
+    with _conn() as con:
+        con.run("DELETE FROM chats WHERE chat_id = :chat_id", chat_id=chat_id)
+
+
+def list_chats() -> list[tuple[int, str]]:
+    """[(chat_id, title)] — спочатку ті, де бот був активний нещодавно."""
+    if not os.environ.get("DATABASE_URL"):
+        return []
+    with _conn() as con:
+        rows = con.run("SELECT chat_id, title FROM chats ORDER BY updated_at DESC")
+        return [(r[0], r[1]) for r in rows]
