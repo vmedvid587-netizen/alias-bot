@@ -22,6 +22,7 @@ from game import (
     get_game, create_game, delete_game,
     is_correct_guess, md,
 )
+import admin
 from db import (
     init_db, save_game_results,
     get_rating_text, get_user_stats, get_user_stats_all_chats,
@@ -735,15 +736,19 @@ def main():
         on_message,
     ))
 
+    admin.register(app)
+
     async def post_init(a):
-        await a.bot.set_my_commands([
+        public_commands = [
             BotCommand("newgame",   "Нова гра"),
             BotCommand("score",     "Рахунок"),
             BotCommand("rating",    "Топ-25 гравців"),
             BotCommand("mystats",   "Моя статистика"),
             BotCommand("endgame",   "Завершити гру"),
             BotCommand("help",      "Правила"),
-        ])
+        ]
+        await a.bot.set_my_commands(public_commands)
+        await admin.post_init(a, public_commands)
 
     app.post_init = post_init
 
