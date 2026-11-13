@@ -20,10 +20,10 @@ from telegram.error import BadRequest
 from game import (
     Game, GameState, ActiveWord,
     get_game, create_game, delete_game,
-    is_correct_guess,
+    is_correct_guess, md,
 )
 from db import (
-    init_db, record_game_results,
+    init_db, save_game_results,
     get_rating_text, get_user_stats, get_user_stats_all_chats,
 )
 
@@ -51,14 +51,33 @@ def _cancel_jobs(context: ContextTypes.DEFAULT_TYPE, name: str):
         job.schedule_removal()
 
 
+async def _db_add(chat_id: int, user_id: int, name: str, *,
+                  turns: int = 0, explained: int = 0,
+                  guessed: int = 0, hearts: int = 0):
+    """Додає статистику в БД у фоновому потоці.
+
+    Помилка БД не повинна ламати гру: раніше виняток тут залишав гру
+    «зависнути» (таймер скасовано, а слово так і не закрито)."""
+    try:
+        await asyncio.to_thread(save_game_results, chat_id, [{
+            "user_id": user_id, "name": name, "turns": turns,
+            "explained": explained, "guessed": guessed, "hearts": hearts,
+        }])
+    except Exception:
+        logger.exception("Не вдалося зберегти статистику в БД")
+
+
+MAX_REACTIONS_KEPT = 30   # скільки останніх повідомлень-реакцій пам'ятаємо на чат
+
+
+def _reactions(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> dict:
+    """msg_id повідомлення-реакції → дані про слово (ведучий, серця)."""
+    return context.bot_data.setdefault(f"reactions_{chat_id}", {})
 
 
 def _start_word_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, word: str):
     """Запускає таймер на 10 хвилин для поточного слова."""
-    # Скасовуємо ВСІ існуючі word-таймери для цього чату
-    for job in context.application.job_queue.jobs():
-        if job.name and job.name.startswith(f"word_{chat_id}"):
-            job.schedule_removal()
+    _cancel_jobs(context, f"word_{chat_id}")
     context.application.job_queue.run_once(
         _word_timeout_cb,
         WORD_TIMEOUT,
@@ -108,16 +127,16 @@ async def _word_timeout_cb(context: ContextTypes.DEFAULT_TYPE):
     if aw.reaction_msg_id:
         await _remove_kb(context, chat_id, aw.reaction_msg_id)
 
+    game.state = GameState.FINISHED
+    delete_game(chat_id)
     await context.bot.send_message(
         chat_id,
         f"⏰ *10 хвилин без вгаданих слів — сесію завершено!*\n\n"
         f"Останнє слово *{aw.word.upper()}* так і не вгадали 🤷\n"
-        f"Пояснював: *{exp_name}*\n\n"
+        f"Пояснював: *{md(exp_name)}*\n\n"
         + game.get_scoreboard(),
         parse_mode=ParseMode.MARKDOWN,
     )
-    game.state = GameState.FINISHED
-    delete_game(chat_id)
 
 
 
@@ -172,7 +191,7 @@ def _card_text(game: Game, aw: ActiveWord, note: str = "") -> str:
     if note:
         lines.append(note + "\n")
     lines += [
-        f"🎙 Пояснює: *{explainer.name if explainer else '?'}*",
+        f"🎙 Пояснює: *{md(explainer.name) if explainer else '?'}*",
         "",
         "💬 _Пишіть варіанти в чат — бот зарахує автоматично!_",
         "_Ведучий: натисни 👁 щоб переглянути слово_",
@@ -206,9 +225,8 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "Бот *автоматично* розпізнає правильну відповідь.\n\n"
         "🖐 Після вгадування — натисни *«Хочу пояснювати!»* щоб взяти наступне слово.\n"
         "💚 Постав серце ведучому якщо пояснення сподобалось.\n\n"
-        "⏰ Якщо слово не вгадали за *10 хвилин* — воно скипується.\n"
-        "😴 Сесія завершується після *20 хвилин* без вгаданих слів "
-        "або *5 хвилин* без ведучого.",
+        "⏭ Ведучий може взяти *нове слово*, якщо поточне не йде.\n"
+        "⏰ Якщо слово не вгадали за *10 хвилин* — гра завершується.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -234,10 +252,11 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Чистимо стан попередньої гри
     context.bot_data.pop(f"volunteer_msg_{chat.id}", None)
     context.bot_data.pop(f"last_reaction_{chat.id}", None)
+    context.bot_data.pop(f"reactions_{chat.id}", None)
 
     await update.message.reply_text(
         f"🚀 *Гра Еліас починається!*\n\n"
-        f"Перше слово пояснює *{uname(user)}*!",
+        f"Перше слово пояснює *{md(uname(user))}*!",
         parse_mode=ParseMode.MARKDOWN,
     )
     await _give_word(context, chat.id, user.id)
@@ -252,7 +271,8 @@ async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _ask_for_volunteer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Публікує або оновлює кнопку 'Хочу пояснювати'."""
     game = get_game(chat_id)
-    if not game or game.state == GameState.FINISHED:
+    # Поки бот чекав, хтось уже міг взяти слово — тоді питати не треба
+    if not game or game.state != GameState.IDLE:
         return
 
     text = (
@@ -286,38 +306,74 @@ async def _ask_for_volunteer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         context.bot_data[vol_key] = msg.message_id
 
 
-
-async def cb_volunteer_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Хтось натиснув 'Хочу пояснювати!'"""
-    q = update.callback_query
-    chat_id = int(q.data.split("_")[2])
+async def _take_turn(q, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Спільна логіка для обох кнопок «🖐 Хочу пояснювати!»
+    (під повідомленням-реакцією та під окремим запрошенням)."""
     game = get_game(chat_id)
-
-    if not game or game.state != GameState.IDLE:
-        await q.answer("Зараз це недоступно!", show_alert=True)
+    if not game:
+        await q.answer("Немає активної гри!", show_alert=True)
         return
 
     user = q.from_user
-    game.ensure_player(user.id, uname(user))
+    uid = user.id
 
+    if game.state == GameState.EXPLAINING:
+        aw = game.active_word
+        if aw and uid == aw.explainer_id:
+            await q.answer("Ти зараз ведучий! 😄", show_alert=True)
+        else:
+            await q.answer("Зараз хтось пояснює — зачекай!", show_alert=True)
+        return
+    if game.state != GameState.IDLE:
+        await q.answer("Зараз це недоступно!", show_alert=True)
+        return
+
+    # Ексклюзивне вікно для того, хто щойно вгадав — діє для ОБОХ кнопок
+    last = context.bot_data.get(f"last_reaction_{chat_id}", {})
+    excl_uid = last.get("exclusive_uid")
+    excl_until = last.get("exclusive_until", 0)
+    if excl_uid and time.time() < excl_until and uid != excl_uid:
+        secs = int(excl_until - time.time()) + 1
+        guesser = game.players.get(excl_uid)
+        gname = guesser.name if guesser else "відгадувач"
+        await q.answer(
+            f"Зачекай {secs} сек — зараз черга {gname}, який щойно вгадав!",
+            show_alert=True,
+        )
+        return
+
+    game.ensure_player(uid, uname(user))
     # Блокуємо стан одразу щоб інші натискання не пройшли
     game.state = GameState.EXPLAINING
+    await q.answer()
 
-    # Скасовуємо таймер очікування ведучого
-    context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
+    # Під повідомленням-реакцією лишаємо тільки 💚, прибираємо 🖐
+    react_id = last.get("msg_id")
+    rdata = _reactions(context, chat_id).get(react_id)
+    if react_id and rdata:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id, react_id,
+                reply_markup=_heart_only_keyboard(
+                    chat_id, rdata["hearts_count"], rdata["exp_name"]),
+            )
+        except BadRequest:
+            pass
 
-    # Залишаємо кнопку 💚 — прибираємо тільки 🖐
-    rdata = context.bot_data.get(f"last_reaction_{chat_id}", {})
-    hearts_count = rdata.get("hearts_count", 0)
-    exp_name_r = rdata.get("exp_name", "ведучий")
-    try:
-        await q.edit_message_reply_markup(
-            reply_markup=_heart_only_keyboard(chat_id, hearts_count, exp_name_r)
-        )
-    except Exception:
-        pass
+    # Запрошення «Хто буде пояснювати?» більше не актуальне
+    vol_id = context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
+    if vol_id:
+        await _safe_edit(context, chat_id, vol_id,
+                         f"🖐 Слово взяв(-ла) *{md(uname(user))}*")
 
-    await _give_word(context, chat_id, user.id)
+    await _give_word(context, chat_id, uid)
+
+
+async def cb_volunteer_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Хтось натиснув 'Хочу пояснювати!' під запрошенням."""
+    q = update.callback_query
+    chat_id = int(q.data.split("_", 2)[2])
+    await _take_turn(q, context, chat_id)
 
 
 async def _give_word(
@@ -333,29 +389,23 @@ async def _give_word(
 
     aw = game.start_word(explainer_id)
     if not aw:
+        game.state = GameState.FINISHED
+        delete_game(chat_id)
         await context.bot.send_message(
             chat_id,
             "😱 Слова скінчились! Гра завершена!\n\n" + game.get_scoreboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
-        game.state = GameState.FINISHED
-        delete_game(chat_id)
         return
+
+    # Таймер ставимо одразу, щоб гра не зависла, навіть якщо щось нижче впаде
+    _start_word_timer(context, chat_id, aw.word)
 
     explainer = game.players.get(explainer_id)
     # Рахуємо хід тільки при першому слові (не при скіпі)
     if not existing_card_msg_id and explainer:
         explainer.turns_played += 1
-        # Зберігаємо в БД одразу
-        from db import save_game_results as _save
-        _save(chat_id, [{
-            "user_id":   explainer_id,
-            "name":      explainer.name,
-            "turns":     1,
-            "explained": 0,
-            "guessed":   0,
-            "hearts":    0,
-        }])
+        await _db_add(chat_id, explainer_id, explainer.name, turns=1)
 
     # При скіпі — просто запам'ятовуємо існуючу картку, не надсилаємо нову
     if existing_card_msg_id:
@@ -368,11 +418,6 @@ async def _give_word(
             parse_mode=ParseMode.MARKDOWN,
         )
         aw.card_msg_id = card_msg.message_id
-
-    # Слово ведучий бачить через кнопку 👁 у груповому чаті
-
-    # Таймер 10 хвилин на слово
-    _start_word_timer(context, chat_id, aw.word)
 
 
 # ═══════════════════════ Авто-детекція відповіді ════════════════════
@@ -401,6 +446,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Правильна відповідь! ─────────────────────────────────────────
+    # Спершу закриваємо слово в пам'яті — щоб жодна помилка нижче
+    # (мережа, БД) не залишила гру в стані «пояснюють» без таймера.
+    _cancel_jobs(context, f"word_{chat_id}")
+    game.active_word = None
+    game.state = GameState.IDLE
+
     guesser_name = uname(user)
     player = game.ensure_player(user.id, guesser_name)
     player.guessed += 1
@@ -411,60 +462,44 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if explainer:
         explainer.explained += 1
 
-    # Скасовуємо таймер слова
-    _cancel_jobs(context, f"word_{chat_id}")
+    excl_until = time.time() + VOLUNTEER_EXCL_SEC
 
     # Прибираємо кнопки з картки
     if aw.card_msg_id:
         await _remove_kb(context, chat_id, aw.card_msg_id)
 
-    # Ексклюзивне вікно 🖐 для відгадувача
-    aw.exclusive_uid = user.id
-    aw.exclusive_until = time.time() + VOLUNTEER_EXCL_SEC
-
-    # Зберігаємо дані реакції — потрібні для кнопки 💚
-    explainer_id_for_hearts = aw.explainer_id
-    context.bot_data[f"last_reaction_{chat_id}"] = {
-        "explainer_id":  explainer_id_for_hearts,
-        "exp_name":      exp_name,
-        "hearts_count":  0,
-        "exclusive_uid": user.id,
-        "exclusive_until": time.time() + VOLUNTEER_EXCL_SEC,
-    }
-
-    # Зберігаємо очко відразу в БД (рейтинг оновлюється після кожного слова)
-    from db import save_game_results as _save
-    _save(chat_id, [{
-        "user_id":   user.id,
-        "name":      guesser_name,
-        "turns":     0,
-        "explained": 0,
-        "guessed":   1,
-        "hearts":    0,
-    }])
-    if explainer:
-        _save(chat_id, [{
-            "user_id":   explainer.user_id,
-            "name":      explainer.name,
-            "turns":     0,
-            "explained": 1,
-            "guessed":   0,
-            "hearts":    0,
-        }])
-
     # Реакція
     reaction_msg = await context.bot.send_message(
         chat_id,
-        f"🎉 *{guesser_name}* відгадав(-ла) слово *{guessed_word.upper()}*\n\n"
-        f"Постав 💚 ведучому *{exp_name}*, якщо пояснення сподобалось",
+        f"🎉 *{md(guesser_name)}* відгадав(-ла) слово *{guessed_word.upper()}*\n\n"
+        f"Постав 💚 ведучому *{md(exp_name)}*, якщо пояснення сподобалось",
         reply_markup=_reaction_keyboard(chat_id, 0, exp_name),
         parse_mode=ParseMode.MARKDOWN,
     )
-    aw.reaction_msg_id = reaction_msg.message_id
 
-    # Завершуємо активне слово
-    game.active_word = None
-    game.state = GameState.IDLE
+    # Дані для кнопки 💚 зберігаємо ОКРЕМО для кожного повідомлення —
+    # щоб серце під старим повідомленням діставалось тому ведучому,
+    # який тоді пояснював, а не останньому.
+    reactions = _reactions(context, chat_id)
+    reactions[reaction_msg.message_id] = {
+        "explainer_id": aw.explainer_id,
+        "exp_name":     exp_name,
+        "hearts_count": 0,
+        "given":        set(),
+    }
+    while len(reactions) > MAX_REACTIONS_KEPT:
+        reactions.pop(next(iter(reactions)))
+
+    context.bot_data[f"last_reaction_{chat_id}"] = {
+        "msg_id":          reaction_msg.message_id,
+        "exclusive_uid":   user.id,
+        "exclusive_until": excl_until,
+    }
+
+    # Очки — в БД одразу (рейтинг оновлюється після кожного слова)
+    await _db_add(chat_id, user.id, guesser_name, guessed=1)
+    if explainer:
+        await _db_add(chat_id, explainer.user_id, explainer.name, explained=1)
 
     # Питаємо хто пояснюватиме далі
     await asyncio.sleep(1)
@@ -522,124 +557,57 @@ async def cb_explainer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    parts = q.data.split("_")
-    action  = parts[1]
-    chat_id = int(parts[2])
+    _, action, cid_str = q.data.split("_", 2)
+    chat_id = int(cid_str)
     game = get_game(chat_id)
 
     if not game:
-        await q.answer()
-        return
-
-    # Реакційне повідомлення належить до попереднього слова —
-    # шукаємо його в active_word (може бути None якщо вже нове слово)
-    # Серця і volunteer можуть спрацювати навіть після зміни слова
-    # тому зберігаємо стан реакції в context.bot_data
-
-    key = f"last_reaction_{chat_id}"
-
-    if action == "heart":
-        rdata = context.bot_data.get(key, {})
-        explainer_id = rdata.get("explainer_id")
-        hearts_key   = rdata.get("hearts_key", f"hearts_{chat_id}_{q.message.message_id}")
-
-        if not explainer_id:
-            await q.answer("Хід вже завершено!", show_alert=True)
-            return
-
-        if q.from_user.id == explainer_id:
-            await q.answer("Собі серце не ставлять 😄", show_alert=True)
-            return
-
-        given_set_key = f"hearts_given_{chat_id}_{q.message.message_id}"
-        given_set = context.bot_data.setdefault(given_set_key, set())
-
-        if q.from_user.id in given_set:
-            await q.answer("Ти вже поставив серце! 💚", show_alert=True)
-            return
-
-        given_set.add(q.from_user.id)
-
-        # Нараховуємо серце ведучому в пам'яті
-        exp_player = game.players.get(explainer_id)
-        if exp_player:
-            exp_player.hearts += 1
-
-        count = rdata.get("hearts_count", 0) + 1
-        rdata["hearts_count"] = count
-        context.bot_data[key] = rdata
-
-        # Зберігаємо серце в БД одразу
-        from db import save_game_results as _save
-        exp_name_for_save = rdata.get("exp_name", "ведучий")
-        _save(chat_id, [{
-            "user_id":   explainer_id,
-            "name":      exp_name_for_save,
-            "turns":     0,
-            "explained": 0,
-            "guessed":   0,
-            "hearts":    1,
-        }])
-
-        await q.answer("💚 Дякуємо!")
-        try:
-            await q.edit_message_reply_markup(
-                reply_markup=_reaction_keyboard(chat_id, count, exp_name_for_save)
-            )
-        except BadRequest:
-            pass
+        await q.answer("Гра вже завершена!", show_alert=True)
         return
 
     if action == "volunteer":
-        user = q.from_user
-        uid = user.id
+        await _take_turn(q, context, chat_id)
+        return
 
-        game.ensure_player(uid, uname(user))
+    if action != "heart":
+        await q.answer()
+        return
 
-        # Якщо зараз вже хтось пояснює
-        if game.state == GameState.EXPLAINING:
-            aw = game.active_word
-            if aw and uid == aw.explainer_id:
-                await q.answer("Ти зараз ведучий! 😄", show_alert=True)
-                return
+    rdata = _reactions(context, chat_id).get(q.message.message_id)
+    if not rdata:
+        await q.answer("Цей хід уже давно завершено!", show_alert=True)
+        return
 
-        # Перевірка ексклюзивного вікна
-        rdata = context.bot_data.get(key, {})
-        excl_uid   = rdata.get("exclusive_uid")
-        excl_until = rdata.get("exclusive_until", 0)
+    explainer_id = rdata["explainer_id"]
+    if q.from_user.id == explainer_id:
+        await q.answer("Собі серце не ставлять 😄", show_alert=True)
+        return
+    if q.from_user.id in rdata["given"]:
+        await q.answer("Ти вже поставив серце! 💚", show_alert=True)
+        return
 
-        if excl_uid and time.time() < excl_until and uid != excl_uid:
-            secs = int(excl_until - time.time())
-            guesser = game.players.get(excl_uid)
-            gname = guesser.name if guesser else "відгадувач"
-            await q.answer(
-                f"Зачекай {secs} сек — зараз черга {gname}, який щойно вгадав!",
-                show_alert=True,
-            )
-            return
+    rdata["given"].add(q.from_user.id)
+    rdata["hearts_count"] += 1
 
-        if game.state != GameState.IDLE:
-            await q.answer("Зараз хтось пояснює — зачекай!", show_alert=True)
-            return
+    # Нараховуємо серце ведучому в пам'яті
+    exp_player = game.players.get(explainer_id)
+    if exp_player:
+        exp_player.hearts += 1
 
-        # Блокуємо стан одразу щоб інші натискання не пройшли
-        game.state = GameState.EXPLAINING
+    await q.answer("💚 Дякуємо!")
 
-        # Скасовуємо таймер очікування ведучого
-        context.bot_data.pop(f"volunteer_msg_{chat_id}", None)
+    # Під повідомленням-реакцією 🖐 лишається, лише поки воно останнє і слово вільне
+    last = context.bot_data.get(f"last_reaction_{chat_id}", {})
+    still_open = last.get("msg_id") == q.message.message_id and game.state == GameState.IDLE
+    kb_fn = _reaction_keyboard if still_open else _heart_only_keyboard
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=kb_fn(chat_id, rdata["hearts_count"], rdata["exp_name"])
+        )
+    except BadRequest:
+        pass
 
-        # Залишаємо кнопку 💚 — прибираємо тільки 🖐
-        rdata = context.bot_data.get(f"last_reaction_{chat_id}", {})
-        hearts_count = rdata.get("hearts_count", 0)
-        exp_name_r = rdata.get("exp_name", "ведучий")
-        try:
-            await q.edit_message_reply_markup(
-                reply_markup=_heart_only_keyboard(chat_id, hearts_count, exp_name_r)
-            )
-        except Exception:
-            pass
-
-        await _give_word(context, chat_id, uid)
+    await _db_add(chat_id, explainer_id, rdata["exp_name"], hearts=1)
 
 
 # ════════════════════════════ /score ════════════════════════════════
@@ -653,7 +621,7 @@ async def cmd_score(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if game.active_word:
         exp = game.players.get(game.active_word.explainer_id)
         if exp:
-            text += f"\n\n🎙 Зараз пояснює: *{exp.name}*"
+            text += f"\n\n🎙 Зараз пояснює: *{md(exp.name)}*"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -663,10 +631,12 @@ async def cmd_rating(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         await update.message.reply_text("📊 Рейтинг доступний тільки в групових чатах!")
         return
-    await update.message.reply_text(
-        get_rating_text(update.effective_chat.id),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        text = await asyncio.to_thread(get_rating_text, update.effective_chat.id)
+    except Exception:
+        logger.exception("Рейтинг: помилка БД")
+        text = "⚠️ Рейтинг тимчасово недоступний, спробуй пізніше."
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 # ════════════════════════════ /mystats ══════════════════════════════
@@ -675,21 +645,26 @@ async def cmd_mystats(update: Update, _: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    chat_stats = (
-        get_user_stats(chat_id, user.id)
-        if update.effective_chat.type != "private"
-        else None
-    )
-    all_stats = get_user_stats_all_chats(user.id)
+    try:
+        chat_stats = (
+            await asyncio.to_thread(get_user_stats, chat_id, user.id)
+            if update.effective_chat.type != "private"
+            else None
+        )
+        all_stats = await asyncio.to_thread(get_user_stats_all_chats, user.id)
+    except Exception:
+        logger.exception("Статистика: помилка БД")
+        await update.message.reply_text("⚠️ Статистика тимчасово недоступна, спробуй пізніше.")
+        return
 
     if not all_stats:
         await update.message.reply_text(
-            f"📊 *Статистика {uname(user)}*\n\nЩе немає зіграних ігор!",
+            f"📊 *Статистика {md(uname(user))}*\n\nЩе немає зіграних ігор!",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    lines = [f"📊 *СТАТИСТИКА КОРИСТУВАЧА {uname(user)}*\n"]
+    lines = [f"📊 *СТАТИСТИКА КОРИСТУВАЧА {md(uname(user))}*\n"]
     lines.append(f"Рейтинг: {all_stats['hearts_received']} 💚\n")
 
     if chat_stats and update.effective_chat.type != "private":
@@ -718,8 +693,7 @@ async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Немає активної гри.")
         return
 
-    for job_name in [f"word_{chat_id}", f"inactive_{chat_id}"]:
-        _cancel_jobs(context, job_name)
+    _cancel_jobs(context, f"word_{chat_id}")
 
     aw = game.active_word
     if aw and aw.card_msg_id:

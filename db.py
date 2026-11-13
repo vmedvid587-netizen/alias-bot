@@ -10,6 +10,8 @@ from contextlib import contextmanager
 
 import pg8000.native
 
+from game import md
+
 logger = logging.getLogger(__name__)
 
 
@@ -216,7 +218,7 @@ def get_rating_text(chat_id: int) -> str:
     lines = [f"🏆 *Топ-{min(len(rows), 25)} гравців*\n"]
     for i, r in enumerate(rows):
         lines.append(
-            f"{i + 1}. {r['name']} — "
+            f"{i + 1}. {md(r['name'])} — "
             f"*{r['total_guessed']}* відп."
             + (f"  💚 {r['hearts_received']}" if r["hearts_received"] else "")
         )
